@@ -2,43 +2,46 @@
 
 **Better decisions through rigorous argument.**
 
-Gauntlet is a multi-agent argumentation harness exposed as a REST API. Submit a claim — a recommendation, a decision, a proposed action — and Gauntlet subjects it to a structured sequence of theoretical challenges before returning either a justified verdict or an honest record of why justification could not be reached.
+Gauntlet is a multi-agent argumentation harness exposed as a REST API. Submit a claim — a clinical recommendation, an architectural decision, a proposed action — and Gauntlet subjects it to a structured sequence of theoretical challenges, runs the logical contrary through the same gauntlet independently, and returns a justified comparative verdict with a full step-by-step trace of everything that happened.
 
-Most AI systems optimise for an answer. Gauntlet optimises for a *justified* answer and treats the two as distinct.
+A claim that survives without its contrary also failing produces only a *plausible* conclusion. Gauntlet produces *definite* conclusions — or tells you honestly why it cannot.
 
 ```
 POST /v1/evaluate
-{ "claim": "deprioritise this patient", "dialogue_type": "deliberation", ... }
+{ "claim": "deprioritise this patient",
+  "dialogue_type": "deliberation",
+  "domain_standard": "experienced emergency clinician, NICE NG185" }
 
-→ { "verdict": "defeated", "qualifier": "presumably",
-    "acceptance_gap": "Required: troponin result at T+0 per NICE NG185",
-    "rebuttal_log": [...], "cycles_run": 1 }
+→ {
+    "comparison": "wrong_starting_position",
+    "recommended_position": "do not deprioritise this patient",
+    "claim_evaluation":   { "verdict": "defeated", "acceptance_gap": "Required: troponin at T+0", ... },
+    "contrary_evaluation": { "verdict": "survives", ... },
+    "claim_evaluation": { "trace": [ ... 24 timestamped events ... ] }
+  }
 ```
 
 ---
 
-## Table of Contents
+## Contents
 
 - [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
-  - [The Argument Unit](#the-argument-unit)
-  - [The Agent Sequence](#the-agent-sequence)
+  - [Bipolar Evaluation](#bipolar-evaluation)
+  - [The Five Agents](#the-five-agents)
   - [The Translation Layer](#the-translation-layer)
-  - [Cycle Logic](#cycle-logic)
   - [Field Isolation](#field-isolation)
+  - [Cycle Logic and No-Progress Detection](#cycle-logic-and-no-progress-detection)
+  - [The Pipeline Trace](#the-pipeline-trace)
 - [API Reference](#api-reference)
-  - [POST /v1/evaluate](#post-v1evaluate)
-  - [POST /v1/evaluate/async](#post-v1evaluateasync)
-  - [GET /v1/jobs/{job\_id}](#get-v1jobsjob_id)
-  - [GET /v1/health](#get-v1health)
-- [Request Schema](#request-schema)
-- [Response Schema](#response-schema)
+- [Request and Response Schema](#request-and-response-schema)
+- [The Trace](#the-trace)
 - [Configuration](#configuration)
 - [Changing Models](#changing-models)
 - [Adding Tools](#adding-tools)
-- [Project Structure](#project-structure)
 - [Running Tests](#running-tests)
-- [Design Principles](#design-principles)
+- [Project Structure](#project-structure)
+- [Design Decisions](#design-decisions)
 - [Theoretical Foundations](#theoretical-foundations)
 
 ---
@@ -48,143 +51,295 @@ POST /v1/evaluate
 **Requirements:** Python 3.11+, an [OpenRouter](https://openrouter.ai) API key.
 
 ```bash
-# 1. Clone and install
+# 1. Install
 git clone https://github.com/your-org/gauntlet.git
 cd gauntlet
 pip install -e .
 
 # 2. Configure
 cp .env.example .env
-# Edit .env — set OPENROUTER_API_KEY
+# Set OPENROUTER_API_KEY in .env
 
-# 3. Start the server
+# 3. Start
 python -m gauntlet
-# → Running on http://0.0.0.0:8000
-# → Docs at  http://localhost:8000/docs
+# → http://localhost:8000
+# → http://localhost:8000/docs  (interactive API explorer)
 
-# 4. Submit a claim
-curl -X POST http://localhost:8000/v1/evaluate \
+# 4. Evaluate a claim
+curl -s -X POST http://localhost:8000/v1/evaluate \
   -H "Content-Type: application/json" \
   -d '{
     "claim": "decompose the monolith into microservices",
     "dialogue_type": "deliberation",
     "domain_standard": "senior software architect familiar with CAP theorem and microservices trade-offs",
     "termination_limit": 2
-  }'
+  }' | python -m json.tool
 ```
 
-The interactive API docs at `/docs` let you try every endpoint in the browser.
+The `/docs` endpoint renders the full OpenAPI spec with a browser interface for testing every route.
 
 ---
 
 ## How It Works
 
-A claim enters the system and passes through five specialist agents in sequence. Between every agent handoff, an independent translation layer normalises the language to ensure the next agent evaluates evidence rather than presentation. The cycle repeats until the claim survives, is defeated, or reaches the termination limit.
+### Bipolar Evaluation
+
+Every evaluation runs **two independent pipelines**. The first evaluates the original claim. The second evaluates its logical contrary, generated automatically from the claim text. Both pipelines run against the same `domain_standard` and `termination_limit`. The contrary pipeline constructs its own evidential basis from scratch — it does not inherit any grounds or warrant from the claim pipeline.
 
 ```
-Claim ──► Constructor ──[translate]──► Classifier ──[translate]──► Auditor
-                                                                       │
-          ◄──── cycle if blocked ────────────────────────────────────┘
-                                                                       │
-                                                          [translate]  │
-                                                                       ▼
-                                                               Evaluator
-                                                                   │
-          ◄──── cycle if rejected ─────────────────────────────────┘
-                                                                   │
-                                                          [translate]  │
-                                                                   ▼
-                                                            Resolver
-                                                                │
-                              ┌─────────────────────┬──────────┴─────────┐
-                              ▼                     ▼                    ▼
-                           survives             defeated              impasse
-                         (verdict +           (cycle again        (rebuttal log
-                       rebuttal log)          if < limit)          as output)
+claim: "deprioritise this patient"
+contrary (auto-generated): "do not deprioritise this patient"
+
+Claim pipeline  →  defeated  (troponin not measured)
+Contrary pipeline →  survives  (same standard applied independently)
+
+Comparison: wrong_starting_position
+Recommended: "do not deprioritise this patient"
 ```
 
-### The Argument Unit
+The four possible outcomes:
 
-Every agent operates on a single shared JSON object: the **ArgumentUnit**. The orchestrator owns this object. No agent reads it directly — each receives only a typed projection containing the fields it is permitted to see. This is the architectural mechanism behind field isolation.
+| Comparison | Meaning |
+|---|---|
+| `definite_conclusion` | Claim survives; contrary defeated. Evidence genuinely favours the claim. |
+| `wrong_starting_position` | Contrary survives; claim defeated. You started from the wrong position. |
+| `equipoise` | Both survive. Genuine evidential balance — the decision cannot be justified from available evidence alone. |
+| `insufficient_evidence` | Neither survives. More data is needed before any position can be justified. |
 
-| Field group | Fields | Set by |
-|---|---|---|
-| Identity | `id`, `cycle`, `dialogue_type`, `domain_standard`, `termination_limit` | Initialisation — fixed |
-| Toulmin structure | `claim`, `grounds[]`, `warrant`, `backing`, `qualifier` | Constructor |
-| Classifier output | `scheme`, `critical_questions[]`, `open_attacks[]`, `burden_bearer` | Classifier |
-| Auditor output | `stage_audit`, `rule_violations[]` | Exchange Auditor |
-| Evaluator output | `acceptance`, `acceptance_gap` | Acceptance Evaluator |
-| Resolver output | `attack_graph`, `extension`, `verdict` | Conflict Resolver |
-| Discourse record | `rebuttal_log[]` | Appended throughout — never cleared |
+Only `definite_conclusion` produces a verdict the system can stand behind. The others are honest records of why justification failed.
 
-### The Agent Sequence
+---
+
+### The Five Agents
+
+Five specialist LLM agents run in sequence. Each receives only the fields it is permitted to see — structural field isolation, not instructional. The orchestrator builds typed Pydantic projections from the shared `ArgumentUnit`; agents never touch the full object.
 
 **Agent 0 — Constructor** *(Toulmin, 1958)*
 
-Receives the claim and builds its evidential basis. If grounds are not provided, retrieves them via web search. Surfaces the implicit warrant — what must be true for these grounds to support this claim. Has web search access. Is the most biased agent in the system: it holds the claim and searches for supporting evidence. Does not populate the rebuttal log.
+The most biased agent. Holds the claim and builds its evidential basis. Retrieves grounds via web search if none are provided. Surfaces the implicit warrant — the inferential link from grounds to claim, stated as a defeasible assumption rather than an established fact. On subsequent cycles, receives the `acceptance_gap` from the previous cycle as a neutral retrieval specification and searches specifically for the missing element.
+
+*Has web search. Does not evaluate.*
 
 **Agent 1 — Classifier** *(Walton, 1989–2020)*
 
-Identifies which of Walton's argumentation schemes the warrant instantiates. Attaches the full set of critical questions for that scheme. Evaluates which CQs are answered by the existing grounds and backing. Writes unanswered CQs as undercutting attack vectors. No web search access.
+Names the inferential scheme the warrant instantiates from Walton's taxonomy (argument from sign, from expert opinion, from analogy, from cause to effect, from consequences, from practical reasoning, from position to know). Attaches the complete set of critical questions for that scheme. Marks each CQ as answered or unanswered based on the existing grounds and backing. Unanswered CQs become undercutting attack vectors.
+
+*No tools. Evaluates structure, not truth.*
 
 **Agent 2 — Exchange Auditor** *(Van Eemeren & Grootendorst, 2004)*
 
-Checks whether the exchange is structured fairly enough to resolve the disagreement. Applies the ten pragma-dialectics rules across four stages. A blocking violation returns an `acceptance_gap` to the orchestrator, which sends the argument back to the Constructor. No web search access.
+Checks whether the exchange is structured fairly enough to resolve the disagreement under pragma-dialectics. Applies the ten rules across four stages: confrontation, opening, argumentation, concluding. A blocking violation returns an `acceptance_gap` and the pipeline cycles back to the Constructor. Notable: Rule 2 requires that the cost of the recommended action be placed on the table alongside the cited risk — one-sided risk framing without cost framing is a blocking violation.
+
+*No tools. Evaluates process, not content.*
 
 **Agent 3 — Acceptance Evaluator** *(Perelman & Olbrechts-Tyteca, 1958)*
 
-The only agent that sees `domain_standard`. Applies the universal audience standard: would a reasonable, well-informed expert in this domain act on this argument as currently constructed? Procedural correctness is not the same as rational compellingness — an argument can pass the auditor and fail the evaluator. Has web search access for criterion establishment (retrieving current protocols and standards) — not for case evidence. A rejection returns a specific `acceptance_gap` identifying the missing evidence.
+The only agent that sees `domain_standard`. Applies the universal audience standard: would a reasonable, well-informed expert in this domain act on this argument as currently constructed? Uses web search to verify what the current authoritative standard actually requires — not to find case evidence, only to establish the evidential threshold. If the argument fails, returns a specific, actionable `acceptance_gap` identifying exactly what is missing.
+
+*Has web search. The only agent that sees domain_standard.*
 
 **Agent 4 — Conflict Resolver** *(Dung, 1995 + ASPIC+)*
 
-Collects every attack generated through the exchange. Classifies each as rebuttal (attacks the claim), undercutting (attacks the warrant), or undermining (attacks the grounds). Builds the attack graph, computes the preferred extension, applies reinstatement. Produces one of three verdicts: `survives`, `defeated`, or `impasse`. Appends surviving and defeated attacks to the rebuttal log.
+Collects every attack produced through the exchange. Classifies each as rebuttal (attacks the claim), undercutting (attacks the warrant), or undermining (attacks the grounds). Builds the attack graph, computes the preferred extension, applies reinstatement. An attack that was surviving in cycle 1 but is addressed by new grounds in cycle 2 is marked defeated — the claim is reinstated with respect to that attack.
+
+*No tools. Computes, does not assess.*
+
+---
 
 ### The Translation Layer
 
-Between every agent handoff, the translation layer applies three corrections derived from Mercier & Sperber's (2011) work on argument quality:
+Between every agent handoff, three bias corrections are applied. These run before the next agent receives the ArgumentUnit.
 
-**Selection bias** — Grounds are sorted by `probative_weight` descending. Most evidentially strong evidence first; most vivid or available last. This is deterministic.
+**Selection bias correction** (deterministic): grounds are sorted by `probative_weight` descending. The most evidentially strong evidence appears first. No LLM call, no failure mode.
 
-**Anchoring bias** — The warrant is restated as an explicit assumption to be evaluated rather than an established fact. Open attacks are restated as neutral evidential gaps — not damning indictments and not minor footnotes. The acceptance gap is restated as a neutral retrieval specification (so the Constructor searches for missing evidence rather than defending against a criticism).
+**Anchoring bias correction** (model-assisted, parallel): the warrant is reframed as a defeasible assumption if it contains veridical language ("proves", "confirms", "establishes"). Open attacks are restated as neutral evidential gaps — their weight in Dung's framework comes from graph structure, not from how forcefully they are worded. The acceptance gap is reframed from criticism-language to a neutral retrieval specification, so the Constructor searches for missing evidence rather than rationalising against a perceived attack.
 
-**Qualifier inflation** — The qualifier is calibrated against the mean probative weight of the grounds. If the grounds do not support the expressed confidence, the qualifier is downgraded.
+**Qualifier inflation correction** (hybrid): the mean probative weight of the grounds is computed deterministically. The qualifier is then calibrated to match:
 
-The three LLM calls in the translation layer run in parallel via `asyncio.gather`, cutting translation latency by approximately 60% compared to sequential execution. A fast, cheap model handles translation — the reasoning-heavy agents use the primary model.
+| Mean weight | Qualifier |
+|---|---|
+| < 0.25 | possibly |
+| 0.25 – 0.55 | presumably |
+| 0.55 – 0.75 | probably |
+| > 0.75 | almost certainly |
 
-### Cycle Logic
+The three LLM calls (warrant rewrite, attacks neutralise, gap normalise) run in parallel via `asyncio.gather`. If any fails, the original text is preserved — graceful degradation, never a crash. Token usage from translation is tracked and included in `total_usage`.
 
-After each Resolver call:
-
-- **`survives`** — return the full ArgumentUnit with the complete rebuttal log.
-- **`defeated`** and `cycle < termination_limit` — increment cycle, return to Constructor with `acceptance_gap` as retrieval constraint.
-- **`defeated`** and `cycle == termination_limit` — return the rebuttal log as an impasse record. Do not produce a verdict.
-- **No-progress detection** — if `acceptance_gap` is identical across two consecutive cycles, the Constructor cannot retrieve the missing evidence. Terminate early with `impasse` rather than repeating uselessly.
-
-A documented impasse is an honest output. It tells the caller exactly what the argument could not survive and what evidence would change the outcome.
+---
 
 ### Field Isolation
 
-Field isolation is structural, not instructional. Each agent receives a Pydantic model containing *only* its designated fields — it cannot read fields outside its scope regardless of what its system prompt says.
+Each agent receives a typed Pydantic model containing only its designated fields. The orchestrator constructs these views; agents never touch the full `ArgumentUnit`. This is structural isolation — the field does not exist in the model the agent receives.
 
 | Agent | Cannot see |
 |---|---|
 | Constructor | `domain_standard`, `scheme`, `stage_audit`, `acceptance`, `verdict` |
 | Classifier | `domain_standard`, `rebuttal_log`, `acceptance`, `verdict` |
 | Auditor | `domain_standard`, `acceptance`, `verdict`, `rebuttal_log` |
-| Evaluator | `dialogue_type`, `open_attacks[]`, `rebuttal_log`, `verdict` |
+| Evaluator | `dialogue_type`, `open_attacks`, `rebuttal_log`, `verdict` |
 | Resolver | `domain_standard`, `dialogue_type`, `scheme`, `stage_audit` |
 
-The Evaluator is the only agent that sees `domain_standard`. This isolation is what ensures the evaluator applies the normative standard independently, without being contaminated by the classifier's framing or the auditor's procedural findings.
+The Evaluator is the only agent that sees `domain_standard`. It cannot be told the standard by the claim or the prior agents — it receives it exclusively from the initialisation input. This independence is what makes its verdict meaningful.
+
+---
+
+### Cycle Logic and No-Progress Detection
+
+```
+for cycle in 1..termination_limit:
+
+    Constructor → translate
+    Classifier  → translate
+    Auditor
+      if blocked:
+        translate (gap normalisation)  ← critical: runs even on blocking path
+        if no_progress: verdict = impasse, stop
+        else: continue to next cycle
+
+    translate
+    Evaluator
+      if rejected:
+        translate (gap normalisation)
+        if no_progress: verdict = impasse, stop
+        else: continue to next cycle
+
+    translate
+    Resolver
+      survives → stop
+      impasse  → stop
+      defeated → next cycle (if available)
+```
+
+**No-progress detection**: if the `acceptance_gap` is identical across two consecutive cycles, the Constructor cannot retrieve the missing evidence — it is unavailable. The pipeline terminates with `verdict: impasse` rather than repeating uselessly. The repeated gap is recorded in the trace.
+
+**Translation on blocking path**: the acceptance gap from a blocked auditor is translated through the gap normaliser before cycling back. Without this, the Constructor (which has myside bias) receives a criticism-framed gap and rationalises rather than retrieves. This was a bug in the previous version.
+
+**Rebuttal log completeness**: when the auditor blocks and the pipeline terminates (last cycle or no-progress), the blocking rule violations are appended to `rebuttal_log` as surviving attacks. Previously they disappeared without trace.
+
+---
+
+### The Pipeline Trace
+
+Every meaningful step emits a `TraceEvent`. The full trace is returned in the API response as part of each `ClaimEvaluation`. Users can reconstruct exactly why the verdict was reached.
+
+```json
+{
+  "claim_evaluation": {
+    "verdict": "defeated",
+    "trace": [
+      {
+        "ts": "2026-04-01T14:23:01.412Z",
+        "kind": "pipeline_start",
+        "position": "claim",
+        "cycle": 0,
+        "detail": { "claim": "deprioritise this patient", "termination_limit": 3 }
+      },
+      {
+        "ts": "2026-04-01T14:23:02.811Z",
+        "kind": "agent_complete",
+        "position": "claim",
+        "cycle": 1,
+        "tokens": { "input_tokens": 1840, "output_tokens": 612 },
+        "detail": {
+          "agent": "Constructor",
+          "grounds_count": 3,
+          "qualifier": "presumably",
+          "warrant_preview": "It is assumed that: negative ECG and age profile indicate..."
+        }
+      },
+      {
+        "ts": "2026-04-01T14:23:04.119Z",
+        "kind": "tool_called",
+        "position": "claim",
+        "cycle": 1,
+        "detail": {
+          "agent": "Constructor",
+          "tool": "web_search",
+          "query": "NICE NG185 troponin rule-out protocol",
+          "result_chars": 892,
+          "result_preview": "NICE guideline NG185 recommends..."
+        }
+      },
+      {
+        "ts": "2026-04-01T14:23:06.204Z",
+        "kind": "agent_complete",
+        "position": "claim",
+        "cycle": 1,
+        "detail": {
+          "agent": "Classifier",
+          "scheme": "argument_from_sign",
+          "open_attacks_count": 2,
+          "answered_cqs": 1,
+          "unanswered_cqs": 2,
+          "burden_bearer": "action-recommender"
+        }
+      },
+      {
+        "ts": "2026-04-01T14:23:08.509Z",
+        "kind": "translation_applied",
+        "position": "claim",
+        "cycle": 1,
+        "tokens": { "input_tokens": 240, "output_tokens": 88 },
+        "detail": {
+          "qualifier_before": "certainly",
+          "qualifier_after": "presumably",
+          "warrant_rewritten": true,
+          "attacks_neutralised": true,
+          "gap_normalised": false,
+          "grounds_reordered": true
+        }
+      },
+      {
+        "ts": "2026-04-01T14:23:10.881Z",
+        "kind": "evaluator_rejected",
+        "position": "claim",
+        "cycle": 1,
+        "detail": { "gap": "Required: troponin result at T+0 per NICE NG185" }
+      },
+      {
+        "ts": "2026-04-01T14:23:19.302Z",
+        "kind": "verdict_reached",
+        "position": "claim",
+        "cycle": 2,
+        "detail": { "verdict": "defeated", "cycles_used": 2 }
+      }
+    ]
+  }
+}
+```
+
+**Event kinds and their detail fields:**
+
+| Kind | Detail fields |
+|---|---|
+| `pipeline_start` | `claim`, `domain_standard`, `termination_limit` |
+| `cycle_start` | `cycle_number`, `total_cycles` |
+| `agent_start` | `agent` |
+| `agent_complete` | `agent` + agent-specific fields (see below) |
+| `tool_called` | `agent`, `tool`, `query`, `result_chars`, `result_preview` |
+| `translation_applied` | `qualifier_before`, `qualifier_after`, `grounds_reordered`, `warrant_rewritten`, `attacks_neutralised`, `gap_normalised` |
+| `auditor_blocked` | `rule`, `stage`, `gap` |
+| `evaluator_rejected` | `gap` |
+| `no_progress_halt` | `repeated_gap`, `cycle` |
+| `verdict_reached` | `verdict`, `cycles_used` |
+
+**Agent-complete detail by agent:**
+
+| Agent | Detail fields |
+|---|---|
+| Constructor | `grounds_count`, `qualifier`, `warrant_preview`, `has_backing` |
+| Classifier | `scheme`, `open_attacks_count`, `answered_cqs`, `unanswered_cqs`, `burden_bearer` |
+| Auditor | `blocked`, `violations_count`, `blocking_violations`, `blocking_rule`, `gap_preview` |
+| Evaluator | `accepted`, `gap_preview` |
+| Resolver | `verdict`, `surviving_attacks`, `defeated_attacks` |
 
 ---
 
 ## API Reference
 
-### POST /v1/evaluate
+### `POST /v1/evaluate`
 
-Synchronous evaluation. Blocks until the pipeline completes. Suitable for direct integration and testing. For production use with long-running cycles, prefer the async endpoint.
-
-**Request**
+Synchronous bipolar evaluation. Blocks until both pipelines complete. Suitable for integration, debugging, and testing. For long-running evaluations in production, prefer the async endpoint.
 
 ```bash
 curl -X POST http://localhost:8000/v1/evaluate \
@@ -192,252 +347,196 @@ curl -X POST http://localhost:8000/v1/evaluate \
   -d '{
     "claim": "deprioritise this patient",
     "dialogue_type": "deliberation",
-    "domain_standard": "experienced emergency clinician, NICE NSTEMI troponin rule-out protocol NG185",
+    "domain_standard": "experienced emergency clinician, NICE NSTEMI troponin rule-out NG185",
     "termination_limit": 3
   }'
 ```
 
-**Response — survives**
+### `POST /v1/evaluate/async`
 
-```json
-{
-  "id": "550e8400-e29b-41d4-a716-446655440000",
-  "verdict": "survives",
-  "qualifier": "presumably",
-  "claim": "deprioritise this patient",
-  "acceptance_gap": null,
-  "rebuttal_log": [
-    {
-      "timestamp": "2026-04-01T12:00:00Z",
-      "agent": "conflict-resolver",
-      "attack_type": "undercutting",
-      "content": "Troponin T+0 absent in cycle 1 — inference from ECG to cardiac risk unvalidated",
-      "status": "defeated"
-    }
-  ],
-  "cycles_run": 2,
-  "no_progress": false,
-  "usage": { "input_tokens": 18400, "output_tokens": 3100 },
-  "argument_unit": { ... }
-}
-```
-
-**Response — impasse**
-
-```json
-{
-  "verdict": "impasse",
-  "qualifier": "presumably",
-  "acceptance_gap": "Required: troponin result at T+0 per NICE NG185 NSTEMI rule-out protocol",
-  "rebuttal_log": [
-    {
-      "attack_type": "undercutting",
-      "content": "Troponin measurement absent — primary biomarker for myocardial injury not evaluated",
-      "status": "surviving"
-    }
-  ],
-  "cycles_run": 3,
-  "no_progress": false,
-  ...
-}
-```
-
----
-
-### POST /v1/evaluate/async
-
-Returns immediately with a job ID. The pipeline runs in the background.
+Async evaluation. Returns `job_id` immediately. Pipeline runs in background.
 
 ```bash
 curl -X POST http://localhost:8000/v1/evaluate/async \
   -H "Content-Type: application/json" \
-  -d '{
-    "claim": "implement mandatory 2FA for all admin routes",
-    "dialogue_type": "deliberation",
-    "domain_standard": "senior security engineer, NIST SP 800-63B authentication guidelines"
-  }'
+  -d '{ "claim": "...", "dialogue_type": "deliberation", "domain_standard": "..." }'
+
+# → { "job_id": "550e8400-e29b-41d4-a716-446655440000" }
 ```
 
-```json
-{ "job_id": "7f4e2c1a-9b3d-4f8e-a2c6-1d5e8f9a0b7c" }
-```
+### `GET /v1/jobs/{job_id}`
 
----
-
-### GET /v1/jobs/{job\_id}
-
-Poll for the result of an async evaluation.
+Poll for result of an async evaluation.
 
 ```bash
-curl http://localhost:8000/v1/jobs/7f4e2c1a-9b3d-4f8e-a2c6-1d5e8f9a0b7c
-```
-
-```json
-{
-  "job_id": "7f4e2c1a-9b3d-4f8e-a2c6-1d5e8f9a0b7c",
-  "status": "complete",
-  "result": { ... },
-  "error": null
-}
+curl http://localhost:8000/v1/jobs/550e8400-e29b-41d4-a716-446655440000
+# → { "job_id": "...", "status": "complete", "result": { ... } }
 ```
 
 `status` values: `pending` → `running` → `complete` | `failed`
 
----
+### `DELETE /v1/jobs/{job_id}`
 
-### GET /v1/health
+Remove a completed job from the in-memory store.
+
+### `GET /v1/health`
 
 ```bash
 curl http://localhost:8000/v1/health
-```
-
-```json
-{
-  "status": "ok",
-  "version": "0.1.0",
-  "primary_model": "anthropic/claude-opus-4-6",
-  "fast_model": "anthropic/claude-haiku-4-5"
-}
+# → { "status": "ok", "version": "0.2.0", "primary_model": "...", "fast_model": "..." }
 ```
 
 ---
 
-## Request Schema
+## Request and Response Schema
 
-All fields for `POST /v1/evaluate` and `POST /v1/evaluate/async`:
+### Request
 
-| Field | Type | Required | Default | Description |
+| Field | Type | Required | Default | Notes |
 |---|---|---|---|---|
-| `claim` | string | Yes | — | The position to be evaluated. Max 2000 characters. |
+| `claim` | string | Yes | — | Max 2000 chars. |
 | `dialogue_type` | enum | Yes | — | `deliberation` \| `inquiry` \| `persuasion` |
-| `domain_standard` | string | Yes | — | Defines the universal audience for the evaluator. Be specific about domain, seniority, and relevant standards. |
-| `termination_limit` | integer | No | `3` | Maximum cycles before impasse. Range: 1–10. |
-| `grounds` | array | No | `null` | Pre-constructed evidence. If omitted, the Constructor retrieves grounds via web search. |
-| `warrant` | string | No | `null` | Explicit inferential link. If omitted, the Constructor surfaces it. |
-| `backing` | string | No | `null` | Authoritative source licensing the warrant. |
-| `qualifier` | string | No | `"presumably"` | Expressed confidence. Calibrated by the translation layer. |
+| `domain_standard` | string | Yes | — | Defines the universal audience for the Evaluator. Be specific. |
+| `termination_limit` | int | No | `3` | Max cycles per position. Range 1–10. |
+| `grounds` | array | No | null | Pre-constructed evidence for the claim pipeline only. |
+| `warrant` | string | No | null | Explicit inferential link for the claim pipeline only. |
+| `backing` | string | No | null | Authoritative source for the warrant. |
+| `qualifier` | string | No | `"presumably"` | Expressed confidence. Recalibrated by translation. |
 
-**Dialogue types**
+**Dialogue types and burden of proof:**
 
-- `deliberation` — deciding what to do. The burden of proof falls on whoever recommends action.
-- `inquiry` — establishing what is true. The burden falls on whoever advances the claim.
-- `persuasion` — resolving a conflict of opinion. The burden falls on the protagonist.
+- `deliberation` — deciding what to do; burden falls on whoever recommends action
+- `inquiry` — establishing what is true; burden falls on whoever advances the claim
+- `persuasion` — resolving a conflict of opinion; burden falls on the protagonist
 
-**Domain standard examples**
+**Domain standard — be specific:**
 
 ```
-# Too vague — evaluator will approximate, not apply
+# Too vague
 "a doctor"
 
-# Good — specific expertise and relevant standard named
-"experienced emergency clinician familiar with NICE NSTEMI troponin rule-out protocol NG185"
+# Good
+"experienced emergency clinician familiar with NICE NSTEMI NG185 troponin rule-out protocol"
 
-# Good — cross-domain
-"senior software architect familiar with CAP theorem, microservices decomposition trade-offs, and current Netflix/Uber decomposition patterns"
+# Good
+"senior software architect familiar with CAP theorem, DDD, and current Netflix/Uber decomposition patterns"
 
-# Good — regulatory domain
-"experienced GDPR compliance officer familiar with ICO enforcement guidance and Article 6 lawful basis requirements"
+# Good
+"GDPR-qualified data protection officer familiar with ICO enforcement guidance and Article 6 lawful basis requirements"
 ```
 
----
-
-## Response Schema
-
-| Field | Type | Description |
-|---|---|---|
-| `id` | string | UUID for this evaluation run. |
-| `verdict` | enum | `survives` \| `defeated` \| `impasse` |
-| `qualifier` | string | Calibrated confidence: `possibly` \| `presumably` \| `probably` \| `almost certainly` |
-| `claim` | string | The original claim as submitted. |
-| `acceptance_gap` | string \| null | What evidence is missing. Null if verdict is `survives`. Present for `defeated` and `impasse`. |
-| `rebuttal_log` | array | Complete record of every attack — surviving and defeated — with timestamps and attribution. |
-| `cycles_run` | integer | How many full agent cycles completed. |
-| `no_progress` | boolean | True if the pipeline terminated early because the acceptance gap was unchanged across cycles. |
-| `usage` | object | `input_tokens` and `output_tokens` for the full run. |
-| `argument_unit` | object | The complete ArgumentUnit for inspection and audit. Contains all intermediate agent outputs. |
-
-**Rebuttal log entry**
+### Response — `GauntletResult`
 
 ```json
 {
-  "timestamp": "2026-04-01T12:00:00Z",
-  "agent": "conflict-resolver",
-  "attack_type": "undercutting | rebuttal | undermining",
-  "content": "Description of the attack",
-  "status": "surviving | defeated"
+  "id": "uuid",
+  "comparison": "definite_conclusion | wrong_starting_position | equipoise | insufficient_evidence",
+  "recommended_position": "string or null",
+  "total_usage": { "input_tokens": 0, "output_tokens": 0 },
+  "claim_evaluation": {
+    "claim": "original claim",
+    "verdict": "survives | defeated | impasse",
+    "qualifier": "presumably",
+    "acceptance_gap": "string or null",
+    "rebuttal_log": [ ... ],
+    "cycles_run": 2,
+    "no_progress": false,
+    "usage": { "input_tokens": 0, "output_tokens": 0 },
+    "argument_unit": { ... },
+    "trace": [ ... ]
+  },
+  "contrary_evaluation": {
+    "claim": "auto-generated contrary",
+    ...same shape as claim_evaluation...
+  }
 }
 ```
+
+`recommended_position` is set to the surviving claim when `comparison` is `definite_conclusion` or `wrong_starting_position`. It is `null` for `equipoise` and `insufficient_evidence`.
 
 ---
 
 ## Configuration
 
-All configuration via environment variables. Copy `.env.example` to `.env` and edit.
+All configuration via environment variables. Copy `.env.example` to `.env`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENROUTER_API_KEY` | — | **Required.** Your OpenRouter API key. Get one at openrouter.ai. |
-| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | OpenRouter endpoint. Change to use a different OpenAI-compatible provider. |
+| `OPENROUTER_API_KEY` | — | **Required.** Get from [openrouter.ai](https://openrouter.ai). |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Override to use any OpenAI-compatible endpoint. |
 | `GAUNTLET_PRIMARY_MODEL` | `anthropic/claude-opus-4-6` | Model for all five reasoning agents. |
-| `GAUNTLET_FAST_MODEL` | `anthropic/claude-haiku-4-5` | Model for the translation layer. Should be cheap and fast. |
-| `GAUNTLET_HOST` | `0.0.0.0` | Server bind address. |
-| `GAUNTLET_PORT` | `8000` | Server port. |
-| `GAUNTLET_RELOAD` | `false` | Enable auto-reload for development (`true` or `false`). |
+| `GAUNTLET_FAST_MODEL` | `anthropic/claude-haiku-4-5` | Model for translation layer and contrary generation. |
+| `GAUNTLET_HOST` | `0.0.0.0` | Bind address. |
+| `GAUNTLET_PORT` | `8000` | Port. |
+| `GAUNTLET_RELOAD` | `false` | Hot reload for development. |
 
 ---
 
 ## Changing Models
 
-Any model available on OpenRouter can be used. Set the model strings in `.env`:
+Any OpenRouter model string works for either role. Models are resolved at startup — no code changes required.
 
 ```bash
-# Use different models per role
+# In .env
+
+# High-capability primary + cheap fast
+GAUNTLET_PRIMARY_MODEL=anthropic/claude-opus-4-6
+GAUNTLET_FAST_MODEL=anthropic/claude-haiku-4-5
+
+# Google models
 GAUNTLET_PRIMARY_MODEL=google/gemini-2.5-pro
 GAUNTLET_FAST_MODEL=google/gemini-2.0-flash
 
-# Or use open models
+# Open models
 GAUNTLET_PRIMARY_MODEL=meta-llama/llama-3.3-70b-instruct
 GAUNTLET_FAST_MODEL=meta-llama/llama-3.1-8b-instruct
 
-# Mix providers
+# Cross-provider mix
 GAUNTLET_PRIMARY_MODEL=anthropic/claude-opus-4-6
 GAUNTLET_FAST_MODEL=openai/gpt-4o-mini
 ```
 
-Per-agent model overrides are available in `src/gauntlet/config.py` if you need finer control (e.g., a cheaper model for the Classifier but a more capable one for the Resolver).
+Per-agent model overrides are available in `config.py` via the `constructor_cfg`, `classifier_cfg`, `auditor_cfg`, `evaluator_cfg`, `resolver_cfg` fields on `GauntletConfig`. This lets you assign a cheaper model to less demanding agents (Classifier, Auditor) and reserve the strongest model for the Evaluator and Resolver.
 
-**Note on model compatibility:** Some models do not support `response_format: json_object`. If you use such a model, add its prefix to `_NO_JSON_MODE` in `src/gauntlet/client.py`. The client falls back to prompt-only JSON instruction.
+**Model compatibility:** Some models do not support `response_format: json_object`. If you use one, add its model string prefix to `_NO_JSON_MODE` in `client.py`. The client falls back to prompt-only JSON instruction automatically.
 
 ---
 
 ## Adding Tools
 
-Tools are the mechanism by which agents retrieve external information. Only the Constructor and Evaluator have tool access — this is enforced structurally, not by instruction.
+Tools are how agents retrieve external information. Only the Constructor and Evaluator have tool access — enforced structurally by which tool names are passed to `run_agent()`.
 
-Adding a new tool requires changes to exactly one file: `src/gauntlet/tools.py`.
+Adding a new tool requires changes to **one file only**: `src/gauntlet/tools.py`.
 
 **Step 1 — Implement the Tool protocol**
 
 ```python
-# src/gauntlet/tools.py
+# In tools.py
 
-class MyCustomTool:
-    name = "my_tool"
-    description = "What this tool does and when to use it."
+class PubMedTool:
+    name        = "pubmed_search"
+    description = (
+        "Search PubMed for peer-reviewed clinical evidence. "
+        "Use for Constructor ground retrieval in clinical domains."
+    )
 
     def openai_schema(self) -> dict:
         return {
             "type": "function",
             "function": {
-                "name": self.name,
+                "name":        self.name,
                 "description": self.description,
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "query": {
-                            "type": "string",
-                            "description": "The search query."
-                        }
+                            "type":        "string",
+                            "description": "PubMed search query.",
+                        },
+                        "max_results": {
+                            "type":    "integer",
+                            "default": 5,
+                        },
                     },
                     "required": ["query"],
                 },
@@ -445,28 +544,50 @@ class MyCustomTool:
         }
 
     async def execute(self, arguments: dict) -> str:
-        query = arguments.get("query", "")
-        # Your implementation here
-        return f"Result for: {query}"
+        query = arguments["query"]
+        # Your implementation — any async HTTP call
+        return f"PubMed results for: {query}"
 ```
 
 **Step 2 — Register and assign**
 
 ```python
-# Still in tools.py — at the bottom, after the class definition
+# Still in tools.py — after the class definition
 
-my_tool = registry.register(MyCustomTool())
+pubmed = registry.register(PubMedTool())
 
 # Give to Constructor (case evidence retrieval)
-CONSTRUCTOR_TOOLS.append("my_tool")
+CONSTRUCTOR_TOOLS.append("pubmed_search")
 
 # Or give to Evaluator (criterion establishment)
-# EVALUATOR_TOOLS.append("my_tool")
+# EVALUATOR_TOOLS.append("pubmed_search")
 ```
 
-That is the complete change. No other files need modification. The tool is immediately available on the next server start.
+That is the complete change. No other files need modification.
 
-**Tool security model:** The `allowed_tools` list passed to `run_agent()` is the only thing that determines which tools an agent can call. An agent that is not given a tool cannot call it — the tool's schema is never included in its API request.
+**Tool permission model:** The `allowed_tools` list passed to `run_agent()` is the only thing that determines what an agent can call. An agent that is not given a tool structurally cannot call it — the schema is never included in its API request.
+
+---
+
+## Running Tests
+
+```bash
+pip install -e ".[dev]"
+
+# All tests
+pytest tests/ -v
+
+# By module
+pytest tests/test_models.py -v       # field isolation (critical invariant)
+pytest tests/test_trace.py -v        # traceability event structure
+pytest tests/test_orchestrator.py -v # bipolar logic, no-progress detection
+pytest tests/test_translation.py -v  # deterministic corrections
+pytest tests/test_validation.py -v   # input guard
+pytest tests/test_tools.py -v        # registry and permissions
+pytest tests/test_api.py -v          # endpoint routing and response shape
+```
+
+The test suite makes **no real LLM calls**. Pipeline functions are mocked in API tests; deterministic logic is tested directly.
 
 ---
 
@@ -475,98 +596,69 @@ That is the complete change. No other files need modification. The tool is immed
 ```
 gauntlet/
 ├── src/gauntlet/
-│   ├── __init__.py          # Package version
-│   ├── __main__.py          # Entry point: python -m gauntlet
-│   ├── config.py            # GauntletConfig — model assignments, env loading
-│   ├── models.py            # ArgumentUnit + all scoped view models + API types
-│   ├── client.py            # Async OpenRouter client (complete_text, complete_json)
+│   ├── __init__.py          # version
+│   ├── __main__.py          # entry point: python -m gauntlet
+│   ├── config.py            # GauntletConfig — model roles, env loading
+│   ├── models.py            # ArgumentUnit, all views, request/response types
+│   ├── trace.py             # PipelineTrace — first-class traceability
+│   ├── client.py            # Async OpenRouter client
 │   ├── tools.py             # Tool protocol, registry, WebSearch, DocumentFetch
 │   ├── validation.py        # Input guard, injection detection
-│   ├── translation.py       # Quality monitor — parallel async LLM corrections
-│   ├── orchestrator.py      # Pipeline: agent sequence, cycle logic, no-progress detection
-│   ├── api.py               # FastAPI routes (sync evaluate, async evaluate, jobs, health)
+│   ├── translation.py       # Quality monitor — parallel async corrections
+│   ├── orchestrator.py      # Bipolar pipeline, cycle logic, no-progress detection
+│   ├── api.py               # FastAPI routes
 │   └── agents/
-│       ├── base.py          # run_agent(): tool loop, retry, permission enforcement
-│       ├── constructor.py   # Agent 0 — Toulmin (has web search)
+│       ├── base.py          # run_agent() — tool loop, retry, tracing
+│       ├── constructor.py   # Agent 0 — Toulmin (web search)
 │       ├── classifier.py    # Agent 1 — Walton (no tools)
 │       ├── auditor.py       # Agent 2 — Van Eemeren (no tools)
-│       ├── evaluator.py     # Agent 3 — Perelman (has web search)
+│       ├── evaluator.py     # Agent 3 — Perelman (web search, criterion only)
 │       └── resolver.py      # Agent 4 — Dung + ASPIC+ (no tools)
 ├── tests/
-│   ├── conftest.py          # Shared fixtures
-│   ├── test_models.py       # View isolation tests (the critical invariant)
-│   ├── test_validation.py   # Input guard tests
-│   ├── test_translation.py  # Deterministic translation tests
-│   ├── test_tools.py        # Registry, protocol compliance, extensibility
-│   └── test_api.py          # Endpoint tests with mocked pipeline
+│   ├── conftest.py
+│   ├── test_models.py       # 18 tests — field isolation
+│   ├── test_trace.py        # 15 tests — event structure
+│   ├── test_orchestrator.py # 14 tests — bipolar logic
+│   ├── test_translation.py  # 8 tests — deterministic corrections
+│   ├── test_validation.py   # 13 tests — input guard
+│   ├── test_tools.py        # 14 tests — registry and permissions
+│   └── test_api.py          # 20 tests — endpoints
 ├── pyproject.toml
 └── .env.example
 ```
 
-**17 source files. 1,939 lines. No framework dependencies beyond FastAPI and the OpenAI client.**
-
-The framework is `orchestrator.py`. It is 168 lines. Every architectural decision is explicit and readable there.
+**18 source files. 2,446 lines. No agent framework dependencies.**
 
 ---
 
-## Running Tests
+## Design Decisions
 
-```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
+**Instructions are not implementations.** An agent told not to read a field will, under adversarial pressure, read it. Gauntlet enforces isolation through typed Pydantic projections: `ClassifierInput` does not contain `domain_standard` — the field simply does not exist. No instruction required.
 
-# Run all tests
-pytest tests/ -v
+**Translation is a function, not an agent.** The quality monitor has no opinion on the claim. It applies three deterministic corrections and three targeted LLM calls for linguistic reframing. It fires at every agent handoff via explicit Python calls. The three LLM calls run in parallel. Token usage is tracked and returned. If any call fails, the original text is preserved.
 
-# Run a specific test file
-pytest tests/test_models.py -v
+**Translation runs on the blocking path.** When the Auditor blocks, the acceptance gap must be translated into a neutral retrieval specification before cycling back to the Constructor. Without this, the Constructor (which has myside bias) receives a criticism-framed gap and rationalises against it rather than retrieving the missing evidence. This is the most consequential bug in prior versions.
 
-# Run tests matching a pattern
-pytest tests/ -k "isolation" -v
-```
+**Traceability is first-class.** The `PipelineTrace` accumulates structured events at every meaningful step — including every tool call, every translation delta, every agent decision point. The full trace is returned in the API response. A user submitting a clinical or legal claim can see exactly what evidence was retrieved, what scheme was identified, what CQs were unanswered, what rule was triggered, and why the verdict was reached. Debugging and auditing are first-class concerns, not afterthoughts.
 
-The tests cover:
+**Contrary pipeline is independent.** The contrary pipeline constructs its own grounds and warrant from scratch. It does not inherit anything from the claim pipeline. This independence is required for the bipolar comparison to be meaningful — two pipelines drawing from the same evidence base would not produce an independent verdict.
 
-- **Field isolation** — the critical invariant that each agent sees only its designated fields
-- **Input validation** — claim length, injection patterns, ground weight ranges
-- **Translation layer** — deterministic qualifier calibration and grounds sorting
-- **Tool registry** — protocol compliance, permission assignment, extensibility pattern
-- **API endpoints** — routing, validation, error handling, response structure
-
-Tests do not make real LLM calls. The pipeline is mocked in API tests. Deterministic translation logic is tested directly.
-
----
-
-## Design Principles
-
-**Instructions are not implementations.** An agent told not to read a field will, under sufficient adversarial pressure, read it anyway. Gauntlet enforces isolation through Pydantic model projections: an agent that receives a `ClassifierInput` model cannot access `domain_standard` because that field does not exist in `ClassifierInput`. No instruction required.
-
-**The translation layer is a function, not an agent.** The quality monitor has no opinion on the claim. It applies three deterministic bias corrections and three targeted LLM calls for linguistic reframing. It fires between every agent handoff via explicit Python calls — not through a hook mechanism that could be bypassed.
-
-**No framework, no lock-in.** The orchestrator is 168 lines of plain Python. There is no LangChain, no LangGraph, no LlamaIndex, no MTHDS. Each agent is one file, one function, one system prompt. The tool loop in `agents/base.py` borrows its pattern from the Claude Code Rust reimplementation's `run_turn()` — a while loop that breaks when the model returns no tool calls.
-
-**Parallel where correct, sequential where required.** The three translation layer LLM calls are independent of each other and run in parallel. The five agents are sequentially dependent — Walton's classifier must run before Van Eemeren's auditor, because the auditor receives `burden_bearer` and `open_attacks` as inputs. Parallelism is applied where the dependencies permit it, not everywhere.
-
-**Honest output under genuine uncertainty.** A three-cycle impasse record is more useful than a forced verdict. The `acceptance_gap` field specifies exactly what evidence would change the outcome, making the impasse actionable rather than merely negative.
+**No agent SDK, no framework.** The orchestrator is 280 lines of plain Python. The entire "framework" is `run_agent()` in `agents/base.py` — a while loop that breaks when the model returns no tool calls. LangChain, LangGraph, NAT, and MTHDS were all evaluated and rejected. Their abstractions either solve a different problem (dynamic routing, which Gauntlet does not need), introduce incompatibilities (NAT does not support OpenRouter natively), or add complexity without adding capability.
 
 ---
 
 ## Theoretical Foundations
 
-Gauntlet implements six traditions in argumentation theory. Each addresses a distinct dimension of the problem of reasoning under uncertainty.
-
-| Theorist | Year | Contribution | Role in Gauntlet |
-|---|---|---|---|
-| Toulmin | 1958 | The argument unit | Breaks every argument into claim, grounds, warrant, backing, qualifier — making the implicit explicit |
-| Walton | 1989–2020 | Argumentation schemes | Names the inference pattern and attaches the specific challenges it must survive |
-| Van Eemeren & Grootendorst | 2004 | Pragma-dialectics | Checks whether the exchange is structured fairly enough to resolve the disagreement |
-| Perelman & Olbrechts-Tyteca | 1958 | The New Rhetoric | Tests whether a reasonable, well-informed expert would act on the argument |
-| Dung | 1995 | Abstract argumentation | Computes which arguments survive when arguments conflict |
-| Mercier & Sperber | 2011 | Argumentative theory of reasoning | Ensures argument acceptance tracks evidential strength, not presentation |
-
-The framework is described in detail in the accompanying blog series:
-- [Part 1 — The Perspectives That Shaped the Field](https://medium.com/@isawatanabe/)
-- [Part 2 — Building AI That Argues Well](https://medium.com/@isawatanabe/argumentation-for-ai-part-2-building-ai-that-argues-well-d9ca04c201e6)
+| Theorist | Work | Role in Gauntlet |
+|---|---|---|
+| Toulmin | *The Uses of Argument* (1958) | Structures every argument as claim, grounds, warrant, backing, qualifier — making implicit assumptions explicit and testable |
+| Walton, Reed & Macagno | *Argumentation Schemes* (2008) | Names the inference pattern and attaches the specific critical questions that scheme must survive |
+| Van Eemeren & Grootendorst | *A Systematic Theory of Argumentation* (2004) | Checks whether the exchange is structured fairly enough to resolve the disagreement — ten rules across four stages |
+| Perelman & Olbrechts-Tyteca | *The New Rhetoric* (1958) | The universal audience standard: would a reasonable, fully-informed expert in this domain act on this argument? |
+| Dung | *On the Acceptability of Arguments* (1995) | Abstract argumentation framework: builds the attack graph, computes which arguments survive in the preferred extension |
+| Prakken & Modgil | *ASPIC+* (2010) | Extends Dung with typed attacks (rebuttal, undercutting, undermining) and structured argument construction |
+| Cayrol & Lagasquie-Schiex | Bipolar argumentation (2005) | Extends Dung to handle both support and attack relations — the formal basis for the claim/contrary comparison |
+| Mercier & Sperber | *The Enigma of Reason* (2011) | Argumentation evolved for persuasion, not truth-seeking — the translation layer corrects for selection bias, anchoring bias, and qualifier inflation |
 
 ---
 
