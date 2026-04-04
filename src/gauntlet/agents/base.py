@@ -1,11 +1,18 @@
 """
 agents/base.py — Async agent runner with tool-use loop and tracing.
 
-Pattern: mirrors Rust claw-code ConversationRuntime.run_turn():
-  while True:
-    call API
-    if tool_calls: execute each → append results → continue
-    else: parse JSON → validate schema → return
+TWO-PHASE EXECUTION:
+  Phase 1 — Tool loop: run until the model stops calling tools OR exhausts
+    max_tool_iters. Accumulates all retrieved evidence in the message history.
+  Phase 2 — Synthesis: one dedicated call with tools=None. The model sees
+    everything it retrieved and is asked to produce its final JSON output.
+    This phase only runs if the tool loop did not naturally self-terminate.
+
+The two phases are separated because some models (e.g. Gemini) do not
+self-terminate the tool loop — they continue calling tools indefinitely
+rather than deciding to finalise. Merging synthesis into the tool loop
+forces a choice: either lie about "sufficient evidence" or never get output.
+The two-phase split is honest: Phase 2 says "based on what you found" — always true.
 
 Permission enforcement is structural: only tools in `allowed_tools` are
 passed to the API call. An agent that isn't given a tool cannot call it.
@@ -68,6 +75,11 @@ async def run_agent(
     trace.agent_start(name, cycle)
     print(f"    [{name}] ", file=sys.stderr, end="", flush=True)
 
+    # ── Phase 1: Tool loop ────────────────────────────────────────────────────
+    # Run until the model self-terminates (returns JSON) or exhausts the budget.
+    # Self-termination is the happy path; budget exhaustion triggers Phase 2.
+    naturally_terminated = False
+
     for _iteration in range(config.max_tool_iters):
         parsed, messages, usage = await client.complete_json(
             model=config.model,
@@ -120,35 +132,62 @@ async def run_agent(
             messages = messages + tool_results
             continue
 
-        # ── JSON response — validate against output schema ────────────────────
-        try:
-            result = output_type.model_validate(parsed)
-            print(f"✓ {total_usage.total()}t", file=sys.stderr)
+        # Model returned JSON — self-terminated
+        naturally_terminated = True
+        parsed_final = parsed
+        break
+
+    # ── Phase 2: Synthesis (only if tool loop did not self-terminate) ─────────
+    # The model has accumulated all retrieved evidence in the message history.
+    # Ask it to synthesize — no tools, no fiction about sufficiency.
+    if not naturally_terminated:
+        print(f"[synthesize] ", file=sys.stderr, end="", flush=True)
+        messages = messages + [{
+            "role": "user",
+            "content": (
+                "Based on the evidence you have retrieved above, "
+                "produce your final JSON response now."
+            ),
+        }]
+        parsed_final, messages, usage = await client.complete_json(
+            model=config.model,
+            system=system,
+            messages=messages,
+            max_tokens=config.max_tokens,
+            retries=config.retries,
+            tools=None,  # synthesis phase — no tool calls permitted
+        )
+        total_usage = total_usage + usage
+        if parsed_final is None:
+            raise RuntimeError(f"[{name}] synthesis phase returned tool calls instead of JSON")
+
+    # ── Validate against output schema ────────────────────────────────────────
+    try:
+        result = output_type.model_validate(parsed_final)
+        print(f"✓ {total_usage.total()}t", file=sys.stderr)
+        return result, total_usage
+
+    except PydanticValidationError as e:
+        # One schema-correction retry
+        messages = messages + [
+            {"role": "assistant", "content": json.dumps(parsed_final)},
+            {"role": "user",      "content": (
+                f"Your response did not match the required schema: {e}\n"
+                f"Required schema:\n{json.dumps(output_type.model_json_schema(), indent=2)}\n"
+                "Please respond with a corrected JSON object only."
+            )},
+        ]
+        parsed2, messages, usage2 = await client.complete_json(
+            model=config.model,
+            system=system,
+            messages=messages,
+            max_tokens=config.max_tokens,
+            retries=1,
+            tools=None,  # schema retry — no tools
+        )
+        total_usage = total_usage + usage2
+        if parsed2 is not None:
+            result = output_type.model_validate(parsed2)
+            print(f"✓(retry) {total_usage.total()}t", file=sys.stderr)
             return result, total_usage
-
-        except PydanticValidationError as e:
-            # One schema-correction retry
-            messages = messages + [
-                {"role": "assistant", "content": json.dumps(parsed)},
-                {"role": "user",      "content": (
-                    f"Your response did not match the required schema: {e}\n"
-                    f"Required schema:\n{json.dumps(output_type.model_json_schema(), indent=2)}\n"
-                    "Please respond with a corrected JSON object only."
-                )},
-            ]
-            parsed2, messages, usage2 = await client.complete_json(
-                model=config.model,
-                system=system,
-                messages=messages,
-                max_tokens=config.max_tokens,
-                retries=1,
-                tools=None,  # schema retry — no tools
-            )
-            total_usage = total_usage + usage2
-            if parsed2 is not None:
-                result = output_type.model_validate(parsed2)
-                print(f"✓(retry) {total_usage.total()}t", file=sys.stderr)
-                return result, total_usage
-            raise RuntimeError(f"[{name}] schema validation failed after retry: {e}")
-
-    raise RuntimeError(f"[{name}] exceeded max tool iterations ({config.max_tool_iters})")
+        raise RuntimeError(f"[{name}] schema validation failed after retry: {e}")

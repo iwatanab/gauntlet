@@ -20,7 +20,7 @@ class AgentConfig:
     model:              str
     max_tokens:         int = 4096
     retries:            int = 2
-    max_tool_iters:     int = 6
+    max_tool_iters:     int = 10
 
 
 @dataclass(frozen=True)
