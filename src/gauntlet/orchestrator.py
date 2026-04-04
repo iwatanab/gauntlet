@@ -32,6 +32,7 @@ TRACEABILITY:
 
 from __future__ import annotations
 
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -55,6 +56,20 @@ from gauntlet.translation import translate
 
 # ── Contrary generation ───────────────────────────────────────────────────────
 
+def _contrary_is_valid(text: str) -> bool:
+    """
+    Check that contrary generation produced a complete, usable sentence.
+    Guards against truncation (ends mid-word/mid-phrase) from token-limit cuts.
+    """
+    t = text.strip()
+    if len(t) < 8:
+        return False
+    # Truncation indicators: ends on an incomplete token
+    if t[-1] in "-,;:(":
+        return False
+    return True
+
+
 async def _generate_contrary(
     claim: str,
     config: GauntletConfig,
@@ -66,6 +81,9 @@ async def _generate_contrary(
     The contrary is the most reasonable opposing position — not a strawman,
     but what a rational person might genuinely hold given the same situation.
     Uses the fast model: this is a linguistic task.
+
+    Validates the result before returning — falls back to "do not <claim>"
+    if the model returns a truncated or empty string.
     """
     system = (
         "You generate the logical contrary of an argumentative claim. "
@@ -74,6 +92,7 @@ async def _generate_contrary(
         "Keep the same level of specificity as the original. "
         "Output only the contrary claim as a single sentence. No preamble."
     )
+    fallback = f"do not {claim}"
     try:
         text, usage = await client.complete_text(
             model=config.fast.model,
@@ -81,9 +100,12 @@ async def _generate_contrary(
             user=f"Generate the logical contrary of: {claim}",
             max_tokens=120,
         )
-        return text.strip() or f"do not {claim}", usage
+        contrary = text.strip()
+        if not _contrary_is_valid(contrary):
+            return fallback, usage
+        return contrary, usage
     except Exception:
-        return f"do not {claim}", TokenUsage()
+        return fallback, TokenUsage()
 
 
 # ── Bipolar comparison ────────────────────────────────────────────────────────
@@ -108,8 +130,25 @@ def _recommended(comp: BipolarComparison, claim: str, contrary: str) -> str | No
 
 # ── No-progress detection ─────────────────────────────────────────────────────
 
+def _gap_key(gap: str) -> str:
+    """
+    Canonical form of an acceptance gap for no-progress comparison.
+
+    The gap normaliser in translation.py rephrases the gap each cycle
+    (adds "Required:" prefix, varies whitespace) — raw string equality
+    therefore misses genuine no-progress loops. Strip the prefix and
+    normalise whitespace so semantically identical gaps compare equal.
+    """
+    key = gap.strip().lower()
+    key = re.sub(r"^required:\s*", "", key)
+    key = re.sub(r"\s+", " ", key)
+    return key
+
+
 def _no_progress(current: str | None, previous: str | None, cycle: int) -> bool:
-    return cycle > 1 and current is not None and current == previous
+    if cycle <= 1 or current is None or previous is None:
+        return False
+    return _gap_key(current) == _gap_key(previous)
 
 
 # ── Timestamp helper ──────────────────────────────────────────────────────────

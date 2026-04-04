@@ -13,6 +13,7 @@ to run_agent() can be called by that agent. No instruction can expand this.
 from __future__ import annotations
 
 import json
+import os
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
@@ -51,15 +52,25 @@ class ToolRegistry:
 registry = ToolRegistry()
 
 
-# ── Built-in: Web Search ──────────────────────────────────────────────────────
+# ── Built-in: Web Search (Tavily) ─────────────────────────────────────────────
 
 class WebSearchTool:
+    """
+    Tavily-backed web search. Replaces DuckDuckGo instant-answer API, which
+    silently returns empty results for most evidence retrieval queries.
+
+    Tavily returns actual web results with scored excerpts.
+    search_depth "advanced" is used for criterion_establishment (guideline
+    lookup) where thoroughness matters; "basic" for ground_retrieval.
+
+    Requires TAVILY_API_KEY in environment.
+    """
     name        = "web_search"
     description = (
         "Search the web for current information. "
         "Constructor: use for ground retrieval (case evidence). "
         "Evaluator: use for criterion establishment (current protocols and standards). "
-        "Returns a summary of the most relevant results."
+        "Returns scored excerpts from the most relevant results."
     )
 
     def openai_schema(self) -> dict[str, Any]:
@@ -92,26 +103,40 @@ class WebSearchTool:
     async def execute(self, arguments: dict[str, Any]) -> str:
         query   = arguments.get("query", "")
         purpose = arguments.get("purpose", "ground_retrieval")
+        api_key = os.environ.get("TAVILY_API_KEY", "")
+        if not api_key:
+            return f"[{purpose}] Search unavailable: TAVILY_API_KEY not set."
+        # Use advanced depth for guideline/standard lookup; basic for evidence retrieval
+        depth = "advanced" if purpose == "criterion_establishment" else "basic"
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.get(
-                    "https://api.duckduckgo.com/",
-                    params={"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"},
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.post(
+                    "https://api.tavily.com/search",
+                    json={
+                        "api_key":        api_key,
+                        "query":          query,
+                        "search_depth":   depth,
+                        "include_answer": True,
+                        "max_results":    5,
+                    },
                 )
+                r.raise_for_status()
                 data = r.json()
 
             parts: list[str] = []
-            if data.get("Abstract"):
-                parts.append(f"Summary: {data['Abstract']}")
-                if data.get("AbstractURL"):
-                    parts.append(f"Source: {data['AbstractURL']}")
-            for topic in data.get("RelatedTopics", [])[:4]:
-                if isinstance(topic, dict) and topic.get("Text"):
-                    parts.append(f"- {topic['Text']}")
+            if data.get("answer"):
+                parts.append(f"Summary: {data['answer']}")
+            for result in data.get("results", [])[:5]:
+                title   = result.get("title", "")
+                content = result.get("content", "")[:400]
+                url     = result.get("url", "")
+                parts.append(f"- {title}: {content}")
+                if url:
+                    parts.append(f"  Source: {url}")
 
             if parts:
                 return f"[{purpose}] Query: {query!r}\n\n" + "\n".join(parts)
-            return f"[{purpose}] Query: {query!r}\n\nNo direct results. Try a more specific query."
+            return f"[{purpose}] Query: {query!r}\n\nNo results returned."
         except Exception as e:
             return f"[{purpose}] Search failed: {e}"
 
