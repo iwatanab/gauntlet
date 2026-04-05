@@ -58,14 +58,12 @@ from gauntlet.translation import translate
 
 def _contrary_is_valid(text: str) -> bool:
     """
-    Check that contrary generation produced a complete, usable sentence.
-    Guards against truncation (ends mid-word/mid-phrase) from token-limit cuts.
+    Guards against truncation from token-limit cuts in contrary generation.
     """
     t = text.strip()
-    if len(t) < 8:
+    if len(t) < 8:           # shorter than "do not X" — empty or garbled output
         return False
-    # Truncation indicators: ends on an incomplete token
-    if t[-1] in "-,;:(":
+    if t[-1] in "-,;:(":     # dangling tokens that indicate mid-phrase truncation
         return False
     return True
 
@@ -139,10 +137,7 @@ def _gap_key(gap: str) -> str:
     therefore misses genuine no-progress loops. Strip the prefix and
     normalise whitespace so semantically identical gaps compare equal.
     """
-    key = gap.strip().lower()
-    key = re.sub(r"^required:\s*", "", key)
-    key = re.sub(r"\s+", " ", key)
-    return key
+    return re.sub(r"\s+", " ", re.sub(r"(?i)^required:\s*", "", gap.strip())).lower()
 
 
 def _no_progress(current: str | None, previous: str | None, cycle: int) -> bool:

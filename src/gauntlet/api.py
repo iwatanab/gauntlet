@@ -48,6 +48,7 @@ async def health() -> dict[str, Any]:
         "version":       "0.2.0",
         "primary_model": _config.primary.model if _config else "unknown",
         "fast_model":    _config.fast.model    if _config else "unknown",
+        "tavily":        "configured" if (_config and _config.tavily_api_key) else "missing",
     }
 
 

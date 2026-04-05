@@ -18,6 +18,18 @@ from typing import Any, Protocol, runtime_checkable
 
 import httpx
 
+# Shared HTTP client — created lazily on first tool call, reused across all
+# subsequent calls. Avoids a TCP handshake + TLS negotiation on every search.
+# asyncio's single-threaded event loop makes the lazy init race-free.
+_http: httpx.AsyncClient | None = None
+
+
+def _get_http() -> httpx.AsyncClient:
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(timeout=15.0, follow_redirects=True)
+    return _http
+
 
 @runtime_checkable
 class Tool(Protocol):
@@ -106,22 +118,20 @@ class WebSearchTool:
         api_key = os.environ.get("TAVILY_API_KEY", "")
         if not api_key:
             return f"[{purpose}] Search unavailable: TAVILY_API_KEY not set."
-        # Use advanced depth for guideline/standard lookup; basic for evidence retrieval
         depth = "advanced" if purpose == "criterion_establishment" else "basic"
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.post(
-                    "https://api.tavily.com/search",
-                    json={
-                        "api_key":        api_key,
-                        "query":          query,
-                        "search_depth":   depth,
-                        "include_answer": True,
-                        "max_results":    5,
-                    },
-                )
-                r.raise_for_status()
-                data = r.json()
+            r = await _get_http().post(
+                "https://api.tavily.com/search",
+                json={
+                    "api_key":        api_key,
+                    "query":          query,
+                    "search_depth":   depth,
+                    "include_answer": True,
+                    "max_results":    5,
+                },
+            )
+            r.raise_for_status()
+            data = r.json()
 
             parts: list[str] = []
             if data.get("answer"):
@@ -175,9 +185,8 @@ class DocumentFetchTool:
         url          = arguments.get("url", "")
         excerpt_only = arguments.get("excerpt_only", True)
         try:
-            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
-                r = await client.get(url, headers={"User-Agent": "Gauntlet/0.2"})
-                text = r.text
+            r    = await _get_http().get(url, headers={"User-Agent": "Gauntlet/0.2"})
+            text = r.text
 
             import re
             text = re.sub(r"<[^>]+>", " ", text)

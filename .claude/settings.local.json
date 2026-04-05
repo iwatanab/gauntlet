@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/isahi/AppData/Local/Temp/claude/C--Users-isahi-Documents-repos-gauntlet/a5344963-76a9-41ef-a8a7-67aa83bab569/tasks//**)",
+      "Read(//c/Users/isahi/AppData/Local/Temp/claude/C--Users-isahi-Documents-repos-gauntlet/a5344963-76a9-41ef-a8a7-67aa83bab569/tasks/**)"
+    ]
+  }
+}

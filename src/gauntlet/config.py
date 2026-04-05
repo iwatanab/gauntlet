@@ -32,6 +32,7 @@ class GauntletConfig:
     # Infrastructure
     openrouter_api_key:  str
     openrouter_base_url: str
+    tavily_api_key:      str
 
     # Per-agent overrides (None = use primary)
     constructor_cfg: AgentConfig | None = None
@@ -77,4 +78,5 @@ class GauntletConfig:
             openrouter_base_url=os.environ.get(
                 "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
             ),
+            tavily_api_key=os.environ.get("TAVILY_API_KEY", ""),
         )

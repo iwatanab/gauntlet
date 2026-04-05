@@ -78,7 +78,7 @@ async def run_agent(
     # ── Phase 1: Tool loop ────────────────────────────────────────────────────
     # Run until the model self-terminates (returns JSON) or exhausts the budget.
     # Self-termination is the happy path; budget exhaustion triggers Phase 2.
-    naturally_terminated = False
+    parsed_final: dict[str, Any] | None = None
 
     for _iteration in range(config.max_tool_iters):
         parsed, messages, usage = await client.complete_json(
@@ -91,7 +91,6 @@ async def run_agent(
         )
         total_usage = total_usage + usage
 
-        # ── Tool calls — execute and continue ─────────────────────────────────
         if parsed is None:
             last_msg   = messages[-1]
             tool_calls = last_msg.get("tool_calls") or []
@@ -112,7 +111,6 @@ async def run_agent(
                     try:
                         args       = json.loads(targs) if isinstance(targs, str) else targs
                         result_str = await tool.execute(args)
-                        # Emit tool use to trace
                         trace.tool_called(
                             agent=name,
                             tool=tname,
@@ -132,15 +130,13 @@ async def run_agent(
             messages = messages + tool_results
             continue
 
-        # Model returned JSON — self-terminated
-        naturally_terminated = True
         parsed_final = parsed
         break
-
-    # ── Phase 2: Synthesis (only if tool loop did not self-terminate) ─────────
-    # The model has accumulated all retrieved evidence in the message history.
-    # Ask it to synthesize — no tools, no fiction about sufficiency.
-    if not naturally_terminated:
+    else:
+        # ── Phase 2: Synthesis ────────────────────────────────────────────────
+        # Tool budget exhausted without self-termination. The model has all
+        # retrieved evidence in context — ask it to structure it now.
+        # Synthesis is a formatting task: one retry is sufficient.
         print(f"[synthesize] ", file=sys.stderr, end="", flush=True)
         messages = messages + [{
             "role": "user",
@@ -154,8 +150,8 @@ async def run_agent(
             system=system,
             messages=messages,
             max_tokens=config.max_tokens,
-            retries=config.retries,
-            tools=None,  # synthesis phase — no tool calls permitted
+            retries=1,
+            tools=None,
         )
         total_usage = total_usage + usage
         if parsed_final is None:
