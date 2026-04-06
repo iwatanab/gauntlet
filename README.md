@@ -4,7 +4,10 @@ Better decisions through rigorous argument.
 
 Gauntlet is an argumentation-theory-based deliberation harness. It takes one deliberative claim, builds the strongest case for it and for its logical contrary, runs both through the same isolated reasoning pipeline, and compares the outcomes.
 
-Status: experimental research harness. The core pipeline is live; the extra tools exposed by `clinical` and `financial` mode are placeholders in this version.
+> [!IMPORTANT]
+> Gauntlet is experimental research software, not a production decision system.
+> Expect breaking changes to prompts, schemas, runtime behavior, and tool integrations while the architecture is still evolving.
+> The core pipeline is live, but `clinical` and `financial` mode currently expose placeholder domain tools, and nothing in this repository should be used for unattended or high-stakes clinical or financial decision-making without independent validation.
 
 ## Why This Exists
 
