@@ -1,180 +1,118 @@
 """
-trace.py — Pipeline traceability as a first-class output.
+trace.py - Hierarchical per-position trace accumulation.
 
-Every meaningful step emits a TraceEvent. The full trace is included in the
-API response, answering questions that matter in high-stakes decisions:
-  - What evidence did the Constructor retrieve and from where?
-  - What scheme did the Classifier assign, and which CQs were unanswered?
-  - What rule did the Auditor trigger?
-  - What did the Evaluator require before it would accept?
-  - What changed during each translation step?
-  - Which attacks survived and which were reinstated?
-
-Events are structured (not free-form text) so downstream tools can filter,
-display, and summarise them without string parsing.
+The public trace is intentionally stage-shaped rather than event-shaped:
+preflight facts, per-cycle stage summaries, and final halt reason.
 """
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from enum import Enum
-from typing import Any, Optional
+from typing import Any, Iterator
 
-from pydantic import BaseModel, Field
-
-from gauntlet.models import TokenUsage
-
-
-class EventKind(str, Enum):
-    # System-level
-    pipeline_start      = "pipeline_start"
-    contrary_generated  = "contrary_generated"
-    pipeline_complete   = "pipeline_complete"
-
-    # Per-cycle
-    cycle_start         = "cycle_start"
-
-    # Per-agent
-    agent_start         = "agent_start"
-    agent_complete      = "agent_complete"
-    tool_called         = "tool_called"
-
-    # Translation
-    translation_applied = "translation_applied"
-
-    # Decision points
-    auditor_blocked     = "auditor_blocked"
-    evaluator_rejected  = "evaluator_rejected"
-    no_progress_halt    = "no_progress_halt"
-    verdict_reached     = "verdict_reached"
+from gauntlet.models import (
+    CycleTrace,
+    PositionMetrics,
+    PositionTrace,
+    StageTrace,
+    TokenUsage,
+    ToolCallTrace,
+)
 
 
-class TraceEvent(BaseModel):
-    """
-    A single timestamped pipeline event.
-
-    position: "claim" | "contrary" | "system"
-    cycle:    0 for system events, 1..n for cycle events
-
-    Detail schemas per kind — all fields are strings or primitives:
-      pipeline_start:      {claim, domain_standard, termination_limit}
-      contrary_generated:  {contrary}
-      pipeline_complete:   {comparison, recommended_position}
-      cycle_start:         {cycle, total_cycles}
-      agent_start:         {agent}
-      agent_complete:      {agent, ...agent-specific...}
-        Constructor:  {grounds_count, qualifier, warrant_preview, tools_used}
-        Classifier:   {scheme, open_attacks_count, answered_cqs, unanswered_cqs, burden_bearer}
-        Auditor:      {blocked, violations_count, blocking_rule, gap_preview}
-        Evaluator:    {accepted, gap_preview}
-        Resolver:     {verdict, surviving_attacks, defeated_attacks}
-      tool_called:         {agent, tool, query, result_chars, result_preview}
-      translation_applied: {qualifier_before, qualifier_after, grounds_reordered,
-                            warrant_rewritten, attacks_neutralised, gap_normalised}
-      auditor_blocked:     {rule, stage, gap}
-      evaluator_rejected:  {gap}
-      no_progress_halt:    {repeated_gap, cycle}
-      verdict_reached:     {verdict, cycles_used}
-    """
-    ts:       str                  # ISO 8601 UTC
-    kind:     EventKind
-    position: str                  # "claim" | "contrary" | "system"
-    cycle:    int                  = 0
-    tokens:   Optional[TokenUsage] = None
-    detail:   dict[str, Any]       = Field(default_factory=dict)
-
-
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_STAGE_KEY = {
+    "Constructor": "constructor",
+    "Critique Bundle": "critique",
+    "Evaluator": "evaluator",
+    "Resolver": "resolver",
+}
 
 
 class PipelineTrace:
-    """
-    Mutable event accumulator for one pipeline run (claim or contrary).
-    Passed into agent runners so they can record tool calls inline.
-    Call .snapshot() to get an immutable list of events for the response.
-    """
+    """Mutable hierarchical trace accumulator for one position."""
 
     def __init__(self, position: str) -> None:
-        self.position = position
-        self._events: list[TraceEvent] = []
+        self._trace = PositionTrace(position=position)
+        self._pending_tools: dict[tuple[int, str], list[ToolCallTrace]] = {}
 
-    def _emit(
-        self,
-        kind: EventKind,
-        cycle: int = 0,
-        tokens: Optional[TokenUsage] = None,
-        **detail: Any,
-    ) -> None:
-        self._events.append(TraceEvent(
-            ts=_now(),
-            kind=kind,
-            position=self.position,
-            cycle=cycle,
-            tokens=tokens,
-            detail=dict(detail),
-        ))
+    def _cycle(self, cycle: int) -> CycleTrace:
+        if self._trace.cycles and self._trace.cycles[-1].cycle == cycle:
+            return self._trace.cycles[-1]
+        item = CycleTrace(cycle=cycle)
+        self._trace.cycles.append(item)
+        return item
 
-    # ── Named emitters — explicit at call sites ────────────────────────────────
+    def _stage_key(self, agent: str) -> str:
+        return _STAGE_KEY.get(agent, agent.lower())
 
-    def pipeline_start(self, claim: str, domain_standard: str, termination_limit: int) -> None:
-        self._emit(EventKind.pipeline_start,
-                   claim=claim, domain_standard=domain_standard,
-                   termination_limit=termination_limit)
+    def _stages(self, cycle: CycleTrace) -> Iterator[StageTrace]:
+        for stage in (cycle.constructor, cycle.critique, cycle.evaluator, cycle.resolver):
+            if stage is not None:
+                yield stage
+
+    def set_preflight(self, summary: dict[str, Any], tokens: TokenUsage | None = None) -> None:
+        self._trace.preflight.update(summary)
+        if tokens:
+            self._trace.preflight_usage = self._trace.preflight_usage + tokens
 
     def cycle_start(self, cycle: int, total: int) -> None:
-        self._emit(EventKind.cycle_start, cycle=cycle,
-                   cycle_number=cycle, total_cycles=total)
-
-    def agent_start(self, agent: str, cycle: int) -> None:
-        self._emit(EventKind.agent_start, cycle=cycle, agent=agent)
-
-    def agent_complete(self, agent: str, cycle: int, tokens: TokenUsage, **detail: Any) -> None:
-        self._emit(EventKind.agent_complete, cycle=cycle, tokens=tokens,
-                   agent=agent, **detail)
+        self._cycle(cycle).decision = f"cycle_started:{cycle}/{total}"
 
     def tool_called(self, agent: str, tool: str, query: str, result: str, cycle: int) -> None:
-        self._emit(EventKind.tool_called, cycle=cycle,
-                   agent=agent, tool=tool, query=query,
-                   result_chars=len(result), result_preview=result[:300])
+        key = (cycle, self._stage_key(agent))
+        self._pending_tools.setdefault(key, []).append(ToolCallTrace(
+            tool=tool,
+            query=query,
+            result_chars=len(result),
+            result_preview=result[:300],
+        ))
 
-    def translation_applied(
-        self, cycle: int,
-        qualifier_before: str, qualifier_after: str,
-        grounds_reordered: bool,
-        warrant_rewritten: bool,
-        attacks_neutralised: bool,
-        gap_normalised: bool,
-        tokens: TokenUsage,
-    ) -> None:
-        self._emit(EventKind.translation_applied, cycle=cycle, tokens=tokens,
-                   qualifier_before=qualifier_before, qualifier_after=qualifier_after,
-                   grounds_reordered=grounds_reordered,
-                   warrant_rewritten=warrant_rewritten,
-                   attacks_neutralised=attacks_neutralised,
-                   gap_normalised=gap_normalised)
+    def agent_complete(self, agent: str, cycle: int, tokens: TokenUsage, **detail: Any) -> None:
+        stage_key = self._stage_key(agent)
+        setattr(
+            self._cycle(cycle),
+            stage_key,
+            StageTrace(
+                status="completed",
+                tokens=tokens,
+                detail=dict(detail),
+                tool_calls=self._pending_tools.pop((cycle, stage_key), []),
+            ),
+        )
 
-    def auditor_blocked(self, cycle: int, rule: str, stage: str, gap: str) -> None:
-        self._emit(EventKind.auditor_blocked, cycle=cycle, rule=rule, stage=stage, gap=gap)
+    def critique_blocked(self, cycle: int, rule: str, stage: str, required_gap: str) -> None:
+        cycle_trace = self._cycle(cycle)
+        if cycle_trace.critique:
+            cycle_trace.critique.status = "blocked"
+            cycle_trace.critique.detail.update({
+                "blocking_rule": rule,
+                "blocking_stage": stage,
+                "required_gap": required_gap,
+            })
+        cycle_trace.decision = "critique_blocked"
 
-    def evaluator_rejected(self, cycle: int, gap: str) -> None:
-        self._emit(EventKind.evaluator_rejected, cycle=cycle, gap=gap)
+    def evaluator_rejected(self, cycle: int, required_gap: str) -> None:
+        cycle_trace = self._cycle(cycle)
+        if cycle_trace.evaluator:
+            cycle_trace.evaluator.status = "rejected"
+            cycle_trace.evaluator.detail["required_gap"] = required_gap
+        cycle_trace.decision = "evaluator_rejected"
 
     def no_progress_halt(self, cycle: int, repeated_gap: str) -> None:
-        self._emit(EventKind.no_progress_halt, cycle=cycle, repeated_gap=repeated_gap)
+        self._trace.halt_reason = "no_progress"
+        cycle_trace = self._cycle(cycle)
+        cycle_trace.decision = "no_progress_halt"
+        for stage in (cycle_trace.critique, cycle_trace.evaluator):
+            if stage and stage.status in {"blocked", "rejected"}:
+                stage.detail["repeated_gap"] = repeated_gap
 
     def verdict_reached(self, cycle: int, verdict: str) -> None:
-        self._emit(EventKind.verdict_reached, cycle=cycle,
-                   verdict=verdict, cycles_used=cycle)
+        self._cycle(cycle).decision = f"verdict:{verdict}"
+        self._trace.halt_reason = verdict
 
-    def snapshot(self) -> list[TraceEvent]:
-        return list(self._events)
-
-    def print_progress(self) -> None:
-        """Write a compact progress line to stderr for live monitoring."""
-        import sys
-        last = self._events[-1] if self._events else None
-        if last:
-            agent = last.detail.get("agent", "")
-            suffix = f" [{agent}]" if agent else ""
-            print(f"  [{self.position}] {last.kind}{suffix}", file=sys.stderr, flush=True)
+    def snapshot(self) -> PositionTrace:
+        self._trace.metrics = PositionMetrics(
+            stage_calls=sum(1 for cycle in self._trace.cycles for _stage in self._stages(cycle)),
+            tool_calls=sum(len(stage.tool_calls) for cycle in self._trace.cycles for stage in self._stages(cycle)),
+            cycles_used=len(self._trace.cycles),
+        )
+        return self._trace.model_copy(deep=True)

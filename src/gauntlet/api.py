@@ -10,8 +10,9 @@ from fastapi import FastAPI, HTTPException
 
 from gauntlet.client      import GauntletClient
 from gauntlet.config      import GauntletConfig
-from gauntlet.models      import EvaluateRequest, EvaluationJob, GauntletResult, JobStatus
-from gauntlet.orchestrator import run_pipeline
+from gauntlet.models      import EvaluateRequest, EvaluationJob, GauntletResult, InputErrorResponse, JobStatus
+from gauntlet.orchestrator import prepare_evaluation_input, run_pipeline
+from gauntlet.parsing     import InputError
 from gauntlet.validation  import ValidationError, validate_request
 
 _config: GauntletConfig | None = None
@@ -30,7 +31,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Gauntlet",
     description="Better decisions through rigorous argument.",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -45,9 +46,9 @@ def _deps() -> tuple[GauntletConfig, GauntletClient]:
 async def health() -> dict[str, Any]:
     return {
         "status":        "ok",
-        "version":       "0.2.0",
+        "version":       "0.3.0",
         "primary_model": _config.primary.model if _config else "unknown",
-        "fast_model":    _config.fast.model    if _config else "unknown",
+        "preflight_model": _config.preflight.model if _config else "unknown",
         "tavily":        "configured" if (_config and _config.tavily_api_key) else "missing",
     }
 
@@ -63,6 +64,10 @@ async def evaluate_sync(request: EvaluateRequest) -> GauntletResult:
     config, client = _deps()
     try:
         return await run_pipeline(request, config, client)
+    except InputError as e:
+        raise HTTPException(422, InputErrorResponse(
+            code=e.code, message=e.message, claims=e.claims
+        ).model_dump())
     except Exception as e:
         raise HTTPException(500, str(e))
 
@@ -76,14 +81,24 @@ async def evaluate_async(request: EvaluateRequest) -> dict[str, str]:
         raise HTTPException(422, {"errors": e.errors})
 
     config, client = _deps()
+    try:
+        prepared = await prepare_evaluation_input(request.input, config, client)
+    except InputError as e:
+        raise HTTPException(422, InputErrorResponse(
+            code=e.code, message=e.message, claims=e.claims
+        ).model_dump())
+
     job_id = str(uuid.uuid4())
     _jobs[job_id] = EvaluationJob(job_id=job_id, status=JobStatus.pending)
 
     async def _run() -> None:
         _jobs[job_id] = EvaluationJob(job_id=job_id, status=JobStatus.running)
         try:
-            result = await run_pipeline(request, config, client)
+            result = await run_pipeline(request, config, client, prepared=prepared)
             _jobs[job_id] = EvaluationJob(job_id=job_id, status=JobStatus.complete, result=result)
+        except InputError as e:
+            _jobs[job_id] = EvaluationJob(job_id=job_id, status=JobStatus.failed,
+                                          error=f"{e.code}: {e.message}")
         except Exception as e:
             _jobs[job_id] = EvaluationJob(job_id=job_id, status=JobStatus.failed, error=str(e))
 

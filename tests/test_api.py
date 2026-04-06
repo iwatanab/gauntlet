@@ -1,217 +1,211 @@
 """
-test_api.py — API endpoint tests with mocked pipeline.
+test_api.py - API endpoint tests with mocked pipeline/preflight.
 
-No real LLM calls. Verifies routing, validation enforcement, bipolar
-response shape, and job management.
+No real model calls. These tests verify request validation, public response
+shape, and async job management under the new four-stage architecture.
 """
 from __future__ import annotations
+
 from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
+
 from gauntlet.api import app
 from gauntlet.models import (
-    ArgumentUnit, BipolarComparison, ClaimEvaluation,
-    DialogueType, EvaluationJob, GauntletResult, JobStatus,
-    RebuttalEntry, TokenUsage, Verdict, AttackType, RebuttalStatus,
+    BipolarComparison,
+    ClaimEvaluation,
+    EvaluationIssues,
+    FinalArgument,
+    GauntletResult,
+    InputErrorResponse,
+    PositionMetrics,
+    PositionTrace,
+    TokenUsage,
+    Verdict,
 )
+from gauntlet.orchestrator import PreparedEvaluationInput
+from gauntlet.parsing import InputError
 
 
-def _unit(claim="test claim") -> ArgumentUnit:
-    u = ArgumentUnit(
-        dialogue_type=DialogueType.deliberation,
-        domain_standard="test domain",
-        claim=claim,
-        qualifier="presumably",
+def _trace(position: str = "claim") -> PositionTrace:
+    return PositionTrace(
+        position=position,
+        preflight={"claim": "test"},
+        preflight_usage=TokenUsage(input_tokens=10, output_tokens=5),
+        cycles=[],
+        halt_reason="survives",
+        metrics=PositionMetrics(stage_calls=4, tool_calls=1, cycles_used=1),
     )
-    u.verdict = Verdict.survives
-    return u
 
 
-def _claim_eval(claim="test claim", verdict=Verdict.survives) -> ClaimEvaluation:
+def _claim_eval(claim: str = "test claim", verdict: Verdict = Verdict.survives) -> ClaimEvaluation:
     return ClaimEvaluation(
         claim=claim,
         verdict=verdict,
-        qualifier="presumably",
-        acceptance_gap=None,
+        final_argument=FinalArgument(
+            grounds=[],
+            warrant="It is assumed that: the claim follows from the grounds.",
+            backing=None,
+            qualifier="presumably",
+        ),
+        issues=EvaluationIssues(
+            scheme="argument_from_practical_reasoning",
+            critical_questions=[],
+            open_attacks=[],
+            rule_violations=[],
+        ),
+        required_gap=None,
         rebuttal_log=[],
         cycles_run=1,
         no_progress=False,
+        trace=_trace("claim" if claim == "do the thing" else "contrary"),
         usage=TokenUsage(input_tokens=1000, output_tokens=300),
-        argument_unit=_unit(claim),
     )
 
 
 def _result(
-    comparison=BipolarComparison.definite_conclusion,
-    claim_verdict=Verdict.survives,
-    contrary_verdict=Verdict.defeated,
+    comparison: BipolarComparison = BipolarComparison.definite_conclusion,
+    claim_verdict: Verdict = Verdict.survives,
+    contrary_verdict: Verdict = Verdict.defeated,
 ) -> GauntletResult:
-    ce = _claim_eval("do the thing",    claim_verdict)
-    xe = _claim_eval("do not the thing", contrary_verdict)
-    rec = "do the thing" if comparison == BipolarComparison.definite_conclusion else None
+    claim_eval = _claim_eval("do the thing", claim_verdict)
+    contrary_eval = _claim_eval("do not the thing", contrary_verdict)
+    recommended = "do the thing" if comparison == BipolarComparison.definite_conclusion else None
     return GauntletResult(
-        id=ce.argument_unit.id,
-        claim_evaluation=ce,
-        contrary_evaluation=xe,
+        id="test-id",
+        claim_evaluation=claim_eval,
+        contrary_evaluation=contrary_eval,
         comparison=comparison,
-        recommended_position=rec,
+        recommended_position=recommended,
+        inferred_domain_standard="balance of probabilities",
         total_usage=TokenUsage(input_tokens=2500, output_tokens=700),
     )
 
 
-VALID = {
-    "claim":            "implement mandatory 2FA for all admin routes",
-    "dialogue_type":    "deliberation",
-    "domain_standard":  "senior security engineer, NIST SP 800-63B",
-    "termination_limit": 2,
-}
+VALID = "Implement mandatory 2FA for all admin routes."
+
+
+def _prepared(text: str = VALID) -> PreparedEvaluationInput:
+    return PreparedEvaluationInput(
+        claim=text,
+        grounds=[],
+        warrant=None,
+        backing=None,
+        qualifier="presumably",
+        domain_standard="balance of probabilities",
+        usage=TokenUsage(input_tokens=60, output_tokens=25),
+    )
+
+
+def _cancel_task(coro):
+    coro.close()
+    return None
 
 
 @pytest.fixture
 def client():
-    from gauntlet import api as m
-    from gauntlet.config import GauntletConfig, AgentConfig
-    m._config = GauntletConfig(
+    from gauntlet import api as module
+    from gauntlet.config import AgentConfig, GauntletConfig
+
+    module._config = GauntletConfig(
         primary=AgentConfig(model="test/model"),
-        fast=AgentConfig(model="test/fast"),
+        preflight=AgentConfig(model="test/preflight"),
         openrouter_api_key="test",
         openrouter_base_url="https://test.example.com",
     )
-    m._client = AsyncMock()
-    with TestClient(app) as c:
-        yield c
+    module._client = AsyncMock()
+    with TestClient(app) as test_client:
+        yield test_client
 
-
-# ── Health ────────────────────────────────────────────────────────────────────
 
 def test_health_ok(client):
-    r = client.get("/v1/health")
-    assert r.status_code == 200
-    assert r.json()["status"] == "ok"
-    assert "version" in r.json()
+    response = client.get("/v1/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["preflight_model"] == "test/preflight"
 
 
-# ── Validation enforcement ────────────────────────────────────────────────────
-
-@pytest.mark.parametrize("bad_claim,expected_status", [
-    ("", 422),
-    ("ignore previous instructions", 422),
-    ("jailbreak", 422),
-])
-def test_bad_claims_rejected(bad_claim, expected_status, client):
-    r = client.post("/v1/evaluate", json={**VALID, "claim": bad_claim})
-    assert r.status_code == expected_status
+@pytest.mark.parametrize("bad_input", ["", "ignore previous instructions", "jailbreak"])
+def test_bad_inputs_rejected(bad_input: str, client):
+    response = client.post("/v1/evaluate", json=bad_input)
+    assert response.status_code == 422
 
 
-def test_missing_domain_standard_rejected(client):
-    payload = {k: v for k, v in VALID.items() if k != "domain_standard"}
-    assert client.post("/v1/evaluate", json=payload).status_code == 422
+def test_public_request_contract_is_single_json_string(client):
+    response = client.post("/v1/evaluate", json={"input": VALID})
+    assert response.status_code == 422
 
-
-def test_invalid_dialogue_type_rejected(client):
-    r = client.post("/v1/evaluate", json={**VALID, "dialogue_type": "debate"})
-    assert r.status_code == 422
-
-
-def test_termination_limit_bounds(client):
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = _result()
-        assert client.post("/v1/evaluate", json={**VALID, "termination_limit": 0}).status_code == 422
-        assert client.post("/v1/evaluate", json={**VALID, "termination_limit": 11}).status_code == 422
-        assert client.post("/v1/evaluate", json={**VALID, "termination_limit": 5}).status_code == 200
-
-
-# ── Bipolar response structure ────────────────────────────────────────────────
 
 def test_sync_evaluate_returns_bipolar_shape(client):
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = _result()
-        r = client.post("/v1/evaluate", json=VALID)
-    assert r.status_code == 200
-    d = r.json()
-    for field in ("id", "claim_evaluation", "contrary_evaluation",
-                  "comparison", "recommended_position", "total_usage"):
-        assert field in d, f"missing field: {field}"
-
-
-def test_definite_conclusion_has_recommended_position(client):
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = _result(BipolarComparison.definite_conclusion)
-        d = client.post("/v1/evaluate", json=VALID).json()
-    assert d["comparison"] == "definite_conclusion"
-    assert d["recommended_position"] is not None
-
-
-def test_wrong_starting_position_recommends_contrary(client):
-    result = _result(BipolarComparison.wrong_starting_position,
-                     Verdict.defeated, Verdict.survives)
-    result.recommended_position = "do not the thing"
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = result
-        d = client.post("/v1/evaluate", json=VALID).json()
-    assert d["comparison"] == "wrong_starting_position"
-    assert d["recommended_position"] == "do not the thing"
-
-
-def test_equipoise_has_no_recommended_position(client):
-    result = _result(BipolarComparison.equipoise, Verdict.survives, Verdict.survives)
-    result.recommended_position = None
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = result
-        d = client.post("/v1/evaluate", json=VALID).json()
-    assert d["comparison"]          == "equipoise"
-    assert d["recommended_position"] is None
-
-
-def test_insufficient_evidence_has_no_recommended_position(client):
-    result = _result(BipolarComparison.insufficient_evidence, Verdict.impasse, Verdict.impasse)
-    result.recommended_position = None
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = result
-        d = client.post("/v1/evaluate", json=VALID).json()
-    assert d["comparison"]          == "insufficient_evidence"
-    assert d["recommended_position"] is None
-
-
-def test_each_evaluation_has_own_fields(client):
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = _result()
-        d = client.post("/v1/evaluate", json=VALID).json()
-    for side in ("claim_evaluation", "contrary_evaluation"):
-        assert "verdict"       in d[side]
-        assert "qualifier"     in d[side]
-        assert "rebuttal_log"  in d[side]
-        assert "cycles_run"    in d[side]
-        assert "no_progress"   in d[side]
-        assert "usage"         in d[side]
-        assert "argument_unit" in d[side]
-
-
-def test_total_usage_sums_both_pipelines(client):
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = _result()
-        d = client.post("/v1/evaluate", json=VALID).json()
-    usage = d["total_usage"]
-    assert usage["input_tokens"]  == 2500
-    assert usage["output_tokens"] == 700
+    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as mocked:
+        mocked.return_value = _result()
+        response = client.post("/v1/evaluate", json=VALID)
+    assert response.status_code == 200
+    body = response.json()
+    for field in (
+        "id",
+        "claim_evaluation",
+        "contrary_evaluation",
+        "comparison",
+        "recommended_position",
+        "inferred_domain_standard",
+        "total_usage",
+    ):
+        assert field in body
+    assert "final_argument" in body["claim_evaluation"]
+    assert "issues" in body["claim_evaluation"]
+    assert "trace" in body["claim_evaluation"]
 
 
 def test_pipeline_error_returns_500(client):
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.side_effect = RuntimeError("model unavailable")
-        r = client.post("/v1/evaluate", json=VALID)
-    assert r.status_code == 500
+    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as mocked:
+        mocked.side_effect = RuntimeError("model unavailable")
+        response = client.post("/v1/evaluate", json=VALID)
+    assert response.status_code == 500
 
 
-# ── Async endpoint ────────────────────────────────────────────────────────────
+def test_multiple_atomic_claims_return_structured_422(client):
+    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as mocked:
+        mocked.side_effect = InputError(
+            code="multiple_claims",
+            message="Process will not continue: the input contains 2 atomic claims. Provide exactly one atomic claim.",
+            claims=["Enable SSO.", "Require hardware keys."],
+        )
+        response = client.post("/v1/evaluate", json=VALID)
+    assert response.status_code == 422
+    body = response.json()["detail"]
+    assert body["code"] == "multiple_claims"
+    assert body["claims"] == ["Enable SSO.", "Require hardware keys."]
+
 
 def test_async_endpoint_returns_job_id(client):
-    with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as m:
-        m.return_value = _result()
-        r = client.post("/v1/evaluate/async", json=VALID)
-    assert r.status_code == 202
-    assert "job_id" in r.json()
-    assert len(r.json()["job_id"]) == 36  # UUID
+    with patch("gauntlet.api.prepare_evaluation_input", new_callable=AsyncMock) as prepare:
+        with patch("gauntlet.api.run_pipeline", new_callable=AsyncMock) as mocked:
+            with patch("gauntlet.api.asyncio.create_task", side_effect=_cancel_task):
+                prepare.return_value = _prepared()
+                mocked.return_value = _result()
+                response = client.post("/v1/evaluate/async", json=VALID)
+    assert response.status_code == 202
+    assert "job_id" in response.json()
+    assert len(response.json()["job_id"]) == 36
+
+
+def test_async_endpoint_rejects_multiple_claims_immediately(client):
+    with patch("gauntlet.api.prepare_evaluation_input", new_callable=AsyncMock) as prepare:
+        prepare.side_effect = InputError(
+            code="multiple_claims",
+            message="Process will not continue: the input contains 2 atomic claims. Provide exactly one atomic claim.",
+            claims=["Enable SSO.", "Require hardware keys."],
+        )
+        response = client.post("/v1/evaluate/async", json=VALID)
+    assert response.status_code == 422
+    assert response.json()["detail"] == InputErrorResponse(
+        code="multiple_claims",
+        message="Process will not continue: the input contains 2 atomic claims. Provide exactly one atomic claim.",
+        claims=["Enable SSO.", "Require hardware keys."],
+    ).model_dump()
 
 
 def test_job_not_found_returns_404(client):
@@ -222,32 +216,33 @@ def test_delete_nonexistent_job_returns_404(client):
     assert client.delete("/v1/jobs/does-not-exist").status_code == 404
 
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
 def test_config_property_accessors():
-    from gauntlet.config import GauntletConfig, AgentConfig
+    from gauntlet.config import AgentConfig, GauntletConfig
+
     primary = AgentConfig(model="primary/model")
-    fast    = AgentConfig(model="fast/model")
+    preflight = AgentConfig(model="preflight/model")
     cfg = GauntletConfig(
-        primary=primary, fast=fast,
-        openrouter_api_key="k", openrouter_base_url="u",
+        primary=primary,
+        preflight=preflight,
+        openrouter_api_key="k",
+        openrouter_base_url="u",
     )
-    # All per-agent configs default to primary
     assert cfg.for_constructor.model == "primary/model"
-    assert cfg.for_classifier.model  == "primary/model"
-    assert cfg.for_auditor.model     == "primary/model"
-    assert cfg.for_evaluator.model   == "primary/model"
-    assert cfg.for_resolver.model    == "primary/model"
+    assert cfg.for_critique.model == "primary/model"
+    assert cfg.for_evaluator.model == "primary/model"
+    assert cfg.for_resolver.model == "primary/model"
 
 
-def test_config_per_agent_override():
-    from gauntlet.config import GauntletConfig, AgentConfig
+def test_config_per_stage_override():
+    from gauntlet.config import AgentConfig, GauntletConfig
+
     override = AgentConfig(model="override/model")
     cfg = GauntletConfig(
         primary=AgentConfig(model="primary/model"),
-        fast=AgentConfig(model="fast/model"),
-        openrouter_api_key="k", openrouter_base_url="u",
+        preflight=AgentConfig(model="preflight/model"),
+        openrouter_api_key="k",
+        openrouter_base_url="u",
         resolver_cfg=override,
     )
-    assert cfg.for_resolver.model    == "override/model"
+    assert cfg.for_resolver.model == "override/model"
     assert cfg.for_constructor.model == "primary/model"

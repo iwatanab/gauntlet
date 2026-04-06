@@ -1,6 +1,8 @@
-"""validation.py — Input guard and injection detection."""
+"""validation.py - Input guard for the single-string public API."""
 from __future__ import annotations
+
 import re
+
 from gauntlet.models import EvaluateRequest
 
 _INJECTIONS = [re.compile(p, re.IGNORECASE) for p in [
@@ -23,26 +25,17 @@ class ValidationError(ValueError):
 
 def validate_request(req: EvaluateRequest) -> None:
     errors: list[str] = []
+    text = req.input
 
-    if not req.claim.strip():
-        errors.append("claim must not be empty")
-    elif len(req.claim) > 2000:
-        errors.append(f"claim length {len(req.claim)} exceeds 2000 characters")
+    if not text.strip():
+        errors.append("input must not be empty")
+    elif len(text) > 4000:
+        errors.append(f"input length {len(text)} exceeds 4000 characters")
 
     for pat in _INJECTIONS:
-        if pat.search(req.claim):
-            errors.append("claim rejected: potential prompt injection detected")
+        if pat.search(text):
+            errors.append("input rejected: potential prompt injection detected")
             break
-
-    if not req.domain_standard.strip():
-        errors.append("domain_standard must not be empty")
-    elif len(req.domain_standard) > 1000:
-        errors.append("domain_standard exceeds 1000 characters")
-
-    if req.grounds:
-        for i, g in enumerate(req.grounds):
-            if not (0.0 <= g.probative_weight <= 1.0):
-                errors.append(f"grounds[{i}].probative_weight out of range [0.0, 1.0]")
 
     if errors:
         raise ValidationError(errors)
