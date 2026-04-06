@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from gauntlet.models import Attack, AttackType, EvaluateRequest, Ground, PipelineState
+from gauntlet.models import Attack, AttackType, EvaluateRequest, Ground, PositionState
 
 
 @pytest.fixture
@@ -14,10 +14,10 @@ def base_request() -> EvaluateRequest:
 
 
 @pytest.fixture
-def state_with_grounds() -> PipelineState:
-    return PipelineState(
-        domain_standard="senior engineer, distributed systems",
+def state_with_grounds() -> PositionState:
+    return PositionState(
         claim="decompose the monolith",
+        domain_standard="senior engineer, distributed systems",
         grounds=[
             Ground(content="High deploy frequency needed", source="ops"),
             Ground(content="Teams blocked on releases", source="eng"),

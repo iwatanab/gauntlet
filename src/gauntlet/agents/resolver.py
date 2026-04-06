@@ -4,7 +4,7 @@ from __future__ import annotations
 from gauntlet.agents.base import run_agent
 from gauntlet.client import GauntletClient
 from gauntlet.config import AgentConfig
-from gauntlet.models import ResolverInput, ResolverOutput, TokenUsage
+from gauntlet.models import ResolverInput, ResolverOutput, StageSummary, TokenUsage
 from gauntlet.trace import PipelineTrace
 
 _SYSTEM = """\
@@ -16,7 +16,7 @@ You do not assess what merely seems stronger.
 
 INPUT: claim, grounds[], warrant, backing, qualifier,
        open_attacks[], rule_violations[], required_gap, rebuttal_log[],
-       cycle, termination_limit
+       final_cycle
 NOT VISIBLE: domain_standard, stage_audit details.
 
 IMPORTANT:
@@ -41,17 +41,12 @@ ALGORITHM:
    - required_gap always survives if present.
 4. Verdict:
    - all attacks defeated -> survives
-   - any surviving attack and cycle < termination_limit -> defeated
-   - any surviving attack and cycle == termination_limit -> impasse
+   - any surviving attack and final_cycle:false -> defeated
+   - any surviving attack and final_cycle:true -> impasse
 5. Append every attack result to rebuttal_log.
 
 OUTPUT - JSON only:
 {
-  "attack_graph": {
-    "nodes": [{"id":"A0","description":"..."}],
-    "edges": [{"from":"U1","to":"A0","attack_type":"undercutting"}]
-  },
-  "extension": "preferred",
   "verdict": "survives",
   "rebuttal_log": [
     {"timestamp":"2026-04-01T12:00:00Z","agent":"conflict-resolver",
@@ -85,9 +80,10 @@ async def run_resolver(
         "Resolver",
         cycle,
         usage,
-        verdict=out.verdict.value,
-        surviving_attacks=surviving,
-        defeated_attacks=defeated,
+        StageSummary(
+            verdict=out.verdict,
+            surviving_attacks=surviving,
+            defeated_attacks=defeated,
+        ),
     )
-    trace.verdict_reached(cycle, out.verdict.value)
     return out, usage

@@ -12,7 +12,7 @@ from gauntlet.models import (
     EvaluateRequest,
     EvaluatorInput,
     Ground,
-    PipelineState,
+    PositionState,
     ResolverInput,
     TokenUsage,
     constructor_view,
@@ -22,12 +22,16 @@ from gauntlet.models import (
 )
 
 
-def make_state(**kw) -> PipelineState:
+def make_state(**kw) -> PositionState:
     defaults = dict(
-        domain_standard="senior engineer, distributed systems",
         claim="decompose the monolith",
+        domain_standard="senior engineer, distributed systems",
+        grounds=[],
+        warrant=None,
+        backing=None,
+        qualifier="presumably",
     )
-    return PipelineState(**{**defaults, **kw})
+    return PositionState(**{**defaults, **kw})
 
 
 def test_evaluate_request_is_single_string():
@@ -60,14 +64,17 @@ def test_resolver_cannot_see_domain_standard(state_with_grounds):
     assert not hasattr(resolver_view(state_with_grounds), "domain_standard")
 
 
-def test_resolver_receives_cycle_and_required_gap(state_with_grounds):
-    state_with_grounds.cycle = 2
+def test_resolver_receives_final_cycle_and_required_gap(state_with_grounds):
+    state_with_grounds.final_cycle = True
     state_with_grounds.required_gap = "Required: evidence X"
     view = resolver_view(state_with_grounds)
     assert isinstance(view, ResolverInput)
-    assert view.cycle == 2
+    assert view.final_cycle is True
     assert view.required_gap == "Required: evidence X"
-    assert view.termination_limit == state_with_grounds.termination_limit
+
+
+def test_constructor_cannot_see_rebuttal_history(state_with_grounds):
+    assert not hasattr(constructor_view(state_with_grounds), "rebuttal_log")
 
 
 def test_constructor_view_grounds_none_when_empty():
@@ -77,7 +84,8 @@ def test_constructor_view_grounds_none_when_empty():
 
 
 def test_constructor_view_carries_required_gap():
-    state = make_state(required_gap="Required: troponin at T+0")
+    state = make_state()
+    state.required_gap = "Required: troponin at T+0"
     view = constructor_view(state)
     assert view.required_gap == "Required: troponin at T+0"
 

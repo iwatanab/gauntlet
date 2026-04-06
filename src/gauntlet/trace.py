@@ -7,12 +7,14 @@ preflight facts, per-cycle stage summaries, and final halt reason.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+from typing import Iterator, Literal
 
 from gauntlet.models import (
     CycleTrace,
     PositionMetrics,
     PositionTrace,
+    PreflightSummary,
+    StageSummary,
     StageTrace,
     TokenUsage,
     ToolCallTrace,
@@ -49,8 +51,8 @@ class PipelineTrace:
             if stage is not None:
                 yield stage
 
-    def set_preflight(self, summary: dict[str, Any], tokens: TokenUsage | None = None) -> None:
-        self._trace.preflight.update(summary)
+    def set_preflight(self, summary: PreflightSummary, tokens: TokenUsage | None = None) -> None:
+        self._trace.preflight = summary
         if tokens:
             self._trace.preflight_usage = self._trace.preflight_usage + tokens
 
@@ -66,15 +68,22 @@ class PipelineTrace:
             result_preview=result[:300],
         ))
 
-    def agent_complete(self, agent: str, cycle: int, tokens: TokenUsage, **detail: Any) -> None:
+    def agent_complete(
+        self,
+        agent: str,
+        cycle: int,
+        tokens: TokenUsage,
+        summary: StageSummary,
+        status: Literal["completed", "blocked", "rejected"] = "completed",
+    ) -> None:
         stage_key = self._stage_key(agent)
         setattr(
             self._cycle(cycle),
             stage_key,
             StageTrace(
-                status="completed",
+                status=status,
                 tokens=tokens,
-                detail=dict(detail),
+                summary=summary,
                 tool_calls=self._pending_tools.pop((cycle, stage_key), []),
             ),
         )
@@ -83,18 +92,16 @@ class PipelineTrace:
         cycle_trace = self._cycle(cycle)
         if cycle_trace.critique:
             cycle_trace.critique.status = "blocked"
-            cycle_trace.critique.detail.update({
-                "blocking_rule": rule,
-                "blocking_stage": stage,
-                "required_gap": required_gap,
-            })
+            cycle_trace.critique.summary.blocking_rule = rule
+            cycle_trace.critique.summary.blocking_stage = stage
+            cycle_trace.critique.summary.required_gap = required_gap
         cycle_trace.decision = "critique_blocked"
 
     def evaluator_rejected(self, cycle: int, required_gap: str) -> None:
         cycle_trace = self._cycle(cycle)
         if cycle_trace.evaluator:
             cycle_trace.evaluator.status = "rejected"
-            cycle_trace.evaluator.detail["required_gap"] = required_gap
+            cycle_trace.evaluator.summary.required_gap = required_gap
         cycle_trace.decision = "evaluator_rejected"
 
     def no_progress_halt(self, cycle: int, repeated_gap: str) -> None:
@@ -102,8 +109,8 @@ class PipelineTrace:
         cycle_trace = self._cycle(cycle)
         cycle_trace.decision = "no_progress_halt"
         for stage in (cycle_trace.critique, cycle_trace.evaluator):
-            if stage and stage.status in {"blocked", "rejected"}:
-                stage.detail["repeated_gap"] = repeated_gap
+            if stage is not None:
+                stage.summary.repeated_gap = repeated_gap
 
     def verdict_reached(self, cycle: int, verdict: str) -> None:
         self._cycle(cycle).decision = f"verdict:{verdict}"

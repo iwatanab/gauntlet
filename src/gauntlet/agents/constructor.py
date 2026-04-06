@@ -4,7 +4,7 @@ from __future__ import annotations
 from gauntlet.agents.base import run_agent
 from gauntlet.client import GauntletClient
 from gauntlet.config import AgentConfig
-from gauntlet.models import ConstructorInput, ConstructorOutput, TokenUsage
+from gauntlet.models import ConstructorInput, ConstructorOutput, StageSummary, TokenUsage
 from gauntlet.tools import CONSTRUCTOR_TOOLS
 from gauntlet.trace import PipelineTrace
 
@@ -16,7 +16,7 @@ Gauntlet is a deliberation system. You are the most biased stage.
 Your job is to build the strongest defensible argument for the claim.
 You do not decide final acceptability.
 
-INPUT: claim, grounds?, warrant?, backing?, qualifier?, required_gap, rebuttal_log
+INPUT: claim, grounds?, warrant?, backing?, qualifier?, required_gap
 NOT VISIBLE TO YOU: domain_standard, scheme, open_attacks, rule_violations, verdict.
 
 CORE RULES:
@@ -95,9 +95,11 @@ async def run_constructor(
         "Constructor",
         cycle,
         usage,
-        grounds_count=len(out.grounds),
-        qualifier=out.qualifier,
-        warrant_preview=(out.warrant or "")[:120],
-        has_backing=out.backing is not None,
+        StageSummary(
+            grounds_count=len(out.grounds),
+            qualifier=out.qualifier,
+            warrant_preview=(out.warrant or "")[:120],
+            has_backing=out.backing is not None,
+        ),
     )
     return out, usage

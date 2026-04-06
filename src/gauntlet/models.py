@@ -1,5 +1,5 @@
 """
-models.py - Core data models, per-stage views, and API types.
+models.py - Core data models, stage boundaries, and public API types.
 
 BIPOLAR ARCHITECTURE:
 Every evaluation runs both the claim and its logical contrary through the
@@ -8,13 +8,14 @@ pure-Python comparison at the end.
 
 FIELD ISOLATION:
 Each stage receives a Pydantic model containing only its designated fields.
-The orchestrator owns the shared PipelineState and constructs the stage views.
+The orchestrator owns the internal position state and constructs the stage views.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, RootModel
 
@@ -80,24 +81,6 @@ class StageAudit(BaseModel):
     blocked: bool
 
 
-class AttackNode(BaseModel):
-    id: str
-    type: Optional[AttackType] = None
-    description: str
-
-
-class AttackEdge(BaseModel):
-    from_node: str = Field(alias="from")
-    to_node: str = Field(alias="to")
-    attack_type: AttackType
-    model_config = {"populate_by_name": True}
-
-
-class AttackGraph(BaseModel):
-    nodes: list[AttackNode]
-    edges: list[AttackEdge]
-
-
 class RebuttalEntry(BaseModel):
     timestamp: str
     agent: str
@@ -120,35 +103,33 @@ class TokenUsage(BaseModel):
         )
 
 
-class PipelineState(BaseModel):
-    """Shared internal state owned only by the orchestrator."""
-
-    cycle: int = 1
-    domain_standard: str
-    termination_limit: int = 3
-
+@dataclass
+class PositionState:
     claim: str
-    grounds: list[Ground] = Field(default_factory=list)
-    warrant: Optional[str] = None
-    backing: Optional[str] = None
+    domain_standard: str
+    grounds: list[Ground] = field(default_factory=list)
+    warrant: str | None = None
+    backing: str | None = None
     qualifier: str = "presumably"
+    cycle: int = 1
+    final_cycle: bool = False
+    scheme: str | None = None
+    critical_questions: list[CriticalQuestion] = field(default_factory=list)
+    open_attacks: list[Attack] = field(default_factory=list)
+    stage_audit: StageAudit | None = None
+    rule_violations: list[RuleViolation] = field(default_factory=list)
+    required_gap: str | None = None
+    rebuttal_log: list[RebuttalEntry] = field(default_factory=list)
+    verdict: Verdict | None = None
 
-    scheme: Optional[str] = None
-    critical_questions: list[CriticalQuestion] = Field(default_factory=list)
-    open_attacks: list[Attack] = Field(default_factory=list)
-    burden_bearer: Optional[str] = None
-
-    stage_audit: Optional[StageAudit] = None
-    rule_violations: list[RuleViolation] = Field(default_factory=list)
-
-    acceptance: Optional[bool] = None
-    required_gap: Optional[str] = None
-
-    attack_graph: Optional[AttackGraph] = None
-    extension: Optional[str] = None
-    verdict: Optional[Verdict] = None
-
-    rebuttal_log: list[RebuttalEntry] = Field(default_factory=list)
+    def reset_cycle(self) -> None:
+        self.scheme = None
+        self.critical_questions = []
+        self.open_attacks = []
+        self.stage_audit = None
+        self.rule_violations = []
+        self.required_gap = None
+        self.verdict = None
 
 
 class ConstructorInput(BaseModel):
@@ -158,7 +139,6 @@ class ConstructorInput(BaseModel):
     backing: Optional[str] = None
     qualifier: Optional[str] = None
     required_gap: Optional[str] = None
-    rebuttal_log: list[RebuttalEntry] = Field(default_factory=list)
 
 
 class CritiqueInput(BaseModel):
@@ -190,8 +170,7 @@ class ResolverInput(BaseModel):
     rule_violations: list[RuleViolation]
     required_gap: Optional[str]
     rebuttal_log: list[RebuttalEntry]
-    cycle: int
-    termination_limit: int
+    final_cycle: bool
 
 
 class ConstructorOutput(BaseModel):
@@ -205,7 +184,6 @@ class CritiqueOutput(BaseModel):
     scheme: str
     critical_questions: list[CriticalQuestion]
     open_attacks: list[Attack]
-    burden_bearer: str
     stage_audit: StageAudit
     rule_violations: list[RuleViolation]
     required_gap: Optional[str]
@@ -217,25 +195,22 @@ class EvaluatorOutput(BaseModel):
 
 
 class ResolverOutput(BaseModel):
-    attack_graph: AttackGraph
-    extension: str
     verdict: Verdict
     rebuttal_log: list[RebuttalEntry]
 
 
-def constructor_view(state: PipelineState) -> ConstructorInput:
+def constructor_view(state: PositionState) -> ConstructorInput:
     return ConstructorInput(
         claim=state.claim,
-        grounds=state.grounds if state.grounds else None,
+        grounds=state.grounds or None,
         warrant=state.warrant,
         backing=state.backing,
         qualifier=state.qualifier if state.qualifier != "presumably" else None,
         required_gap=state.required_gap,
-        rebuttal_log=state.rebuttal_log,
     )
 
 
-def critique_view(state: PipelineState) -> CritiqueInput:
+def critique_view(state: PositionState) -> CritiqueInput:
     return CritiqueInput(
         claim=state.claim,
         grounds=state.grounds,
@@ -245,7 +220,7 @@ def critique_view(state: PipelineState) -> CritiqueInput:
     )
 
 
-def evaluator_view(state: PipelineState) -> EvaluatorInput:
+def evaluator_view(state: PositionState) -> EvaluatorInput:
     return EvaluatorInput(
         claim=state.claim,
         grounds=state.grounds,
@@ -258,7 +233,7 @@ def evaluator_view(state: PipelineState) -> EvaluatorInput:
     )
 
 
-def resolver_view(state: PipelineState) -> ResolverInput:
+def resolver_view(state: PositionState) -> ResolverInput:
     return ResolverInput(
         claim=state.claim,
         grounds=state.grounds,
@@ -269,8 +244,7 @@ def resolver_view(state: PipelineState) -> ResolverInput:
         rule_violations=state.rule_violations,
         required_gap=state.required_gap,
         rebuttal_log=state.rebuttal_log,
-        cycle=state.cycle,
-        termination_limit=state.termination_limit,
+        final_cycle=state.final_cycle,
     )
 
 
@@ -295,10 +269,42 @@ class ToolCallTrace(BaseModel):
     result_preview: str
 
 
+class PreflightSummary(BaseModel):
+    claim: str
+    domain_standard: str
+    termination_limit: int
+    grounds_count: int | None = None
+    has_warrant: bool | None = None
+    has_backing: bool | None = None
+    generated_from: str | None = None
+
+
+class StageSummary(BaseModel):
+    grounds_count: int | None = None
+    qualifier: str | None = None
+    warrant_preview: str | None = None
+    has_backing: bool | None = None
+    scheme: str | None = None
+    open_attacks_count: int | None = None
+    answered_cqs: int | None = None
+    unanswered_cqs: int | None = None
+    blocked: bool | None = None
+    violations_count: int | None = None
+    blocking_violations: int | None = None
+    accepted: bool | None = None
+    verdict: Verdict | None = None
+    surviving_attacks: int | None = None
+    defeated_attacks: int | None = None
+    required_gap: str | None = None
+    blocking_rule: str | None = None
+    blocking_stage: str | None = None
+    repeated_gap: str | None = None
+
+
 class StageTrace(BaseModel):
-    status: str
+    status: Literal["completed", "blocked", "rejected"]
     tokens: TokenUsage = Field(default_factory=TokenUsage)
-    detail: dict[str, Any] = Field(default_factory=dict)
+    summary: StageSummary
     tool_calls: list[ToolCallTrace] = Field(default_factory=list)
 
 
@@ -319,7 +325,7 @@ class PositionMetrics(BaseModel):
 
 class PositionTrace(BaseModel):
     position: str
-    preflight: dict[str, Any] = Field(default_factory=dict)
+    preflight: Optional[PreflightSummary] = None
     preflight_usage: TokenUsage = Field(default_factory=TokenUsage)
     cycles: list[CycleTrace] = Field(default_factory=list)
     halt_reason: Optional[str] = None
@@ -347,8 +353,6 @@ class ClaimEvaluation(BaseModel):
     issues: EvaluationIssues
     required_gap: Optional[str]
     rebuttal_log: list[RebuttalEntry]
-    cycles_run: int
-    no_progress: bool
     trace: PositionTrace
     usage: TokenUsage
 

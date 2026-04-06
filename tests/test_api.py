@@ -21,6 +21,7 @@ from gauntlet.models import (
     InputErrorResponse,
     PositionMetrics,
     PositionTrace,
+    PreflightSummary,
     TokenUsage,
     Verdict,
 )
@@ -31,7 +32,11 @@ from gauntlet.parsing import InputError
 def _trace(position: str = "claim") -> PositionTrace:
     return PositionTrace(
         position=position,
-        preflight={"claim": "test"},
+        preflight=PreflightSummary(
+            claim="test",
+            domain_standard="balance of probabilities",
+            termination_limit=3,
+        ),
         preflight_usage=TokenUsage(input_tokens=10, output_tokens=5),
         cycles=[],
         halt_reason="survives",
@@ -57,8 +62,6 @@ def _claim_eval(claim: str = "test claim", verdict: Verdict = Verdict.survives) 
         ),
         required_gap=None,
         rebuttal_log=[],
-        cycles_run=1,
-        no_progress=False,
         trace=_trace("claim" if claim == "do the thing" else "contrary"),
         usage=TokenUsage(input_tokens=1000, output_tokens=300),
     )

@@ -13,7 +13,6 @@ import pytest
 
 from gauntlet.config import AgentConfig, GauntletConfig
 from gauntlet.models import (
-    AttackGraph,
     BipolarComparison,
     ClaimEvaluation,
     CriticalQuestion,
@@ -21,12 +20,13 @@ from gauntlet.models import (
     EvaluationIssues,
     FinalArgument,
     PositionTrace,
+    PreflightSummary,
     ResolverOutput,
     RuleViolation,
     StageAudit,
-    TokenUsage,
     Verdict,
     Severity,
+    TokenUsage,
 )
 from gauntlet.orchestrator import (
     _compare,
@@ -56,8 +56,6 @@ def _claim_eval(claim: str, verdict: Verdict) -> ClaimEvaluation:
         issues=EvaluationIssues(),
         required_gap=None,
         rebuttal_log=[],
-        cycles_run=1,
-        no_progress=False,
         trace=PositionTrace(position="claim"),
         usage=TokenUsage(input_tokens=1, output_tokens=1),
     )
@@ -105,7 +103,6 @@ async def test_run_claim_pipeline_loops_on_critique_required_gap():
             scheme="argument_from_sign",
             critical_questions=[CriticalQuestion(question="CQ1", answered=False, answer=None)],
             open_attacks=[],
-            burden_bearer="action-recommender",
             stage_audit=StageAudit(confrontation="ok", opening="blocked", argumentation="ok", blocked=True),
             rule_violations=[RuleViolation(
                 rule="Rule 2 - Burden of Proof",
@@ -119,7 +116,6 @@ async def test_run_claim_pipeline_loops_on_critique_required_gap():
             scheme="argument_from_sign",
             critical_questions=[CriticalQuestion(question="CQ1", answered=True, answer="yes")],
             open_attacks=[],
-            burden_bearer="action-recommender",
             stage_audit=StageAudit(confrontation="ok", opening="ok", argumentation="ok", blocked=False),
             rule_violations=[],
             required_gap=None,
@@ -136,8 +132,6 @@ async def test_run_claim_pipeline_loops_on_critique_required_gap():
             ]):
                 with patch("gauntlet.orchestrator.run_resolver", side_effect=[
                     (ResolverOutput(
-                        attack_graph=AttackGraph(nodes=[], edges=[]),
-                        extension="preferred",
                         verdict=Verdict.survives,
                         rebuttal_log=[],
                     ), TokenUsage(input_tokens=6, output_tokens=2))
@@ -149,12 +143,16 @@ async def test_run_claim_pipeline_loops_on_critique_required_gap():
                         config=_cfg(),
                         client=object(),
                         position="claim",
-                        preflight_summary={"claim": "do the thing"},
+                        preflight_summary=PreflightSummary(
+                            claim="do the thing",
+                            domain_standard="balance of probabilities",
+                            termination_limit=3,
+                        ),
                         preflight_usage=TokenUsage(),
                     )
 
     assert result.verdict == Verdict.survives
-    assert result.cycles_run == 2
+    assert result.trace.metrics.cycles_used == 2
     assert constructor_calls[0].required_gap is None
     assert constructor_calls[1].required_gap == "Required: troponin result at T+0"
 
@@ -169,7 +167,6 @@ async def test_run_claim_pipeline_halts_on_repeated_required_gap():
             scheme="argument_from_sign",
             critical_questions=[],
             open_attacks=[],
-            burden_bearer="action-recommender",
             stage_audit=StageAudit(confrontation="ok", opening="blocked", argumentation="ok", blocked=True),
             rule_violations=[RuleViolation(
                 rule="Rule 2 - Burden of Proof",
@@ -190,14 +187,18 @@ async def test_run_claim_pipeline_halts_on_repeated_required_gap():
                 config=_cfg(),
                 client=object(),
                 position="claim",
-                preflight_summary={"claim": "do the thing"},
+                preflight_summary=PreflightSummary(
+                    claim="do the thing",
+                    domain_standard="balance of probabilities",
+                    termination_limit=3,
+                ),
                 preflight_usage=TokenUsage(),
             )
 
     assert result.verdict == Verdict.impasse
-    assert result.no_progress is True
+    assert result.trace.halt_reason == "no_progress"
     assert result.required_gap == "Required: cost comparison for the alternative action"
-    assert result.cycles_run == 2
+    assert result.trace.metrics.cycles_used == 2
 
 
 @pytest.mark.asyncio

@@ -198,8 +198,8 @@ class DocumentFetchTool:
 
 # ── Register built-ins ────────────────────────────────────────────────────────
 
-web_search     = registry.register(WebSearchTool())
-fetch_document = registry.register(DocumentFetchTool())
+registry.register(WebSearchTool())
+registry.register(DocumentFetchTool())
 
 # Structural permission lists — agents are given one of these
 CONSTRUCTOR_TOOLS: list[str] = ["web_search", "fetch_document"]

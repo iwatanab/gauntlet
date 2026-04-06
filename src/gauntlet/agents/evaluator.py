@@ -4,7 +4,7 @@ from __future__ import annotations
 from gauntlet.agents.base import run_agent
 from gauntlet.client import GauntletClient
 from gauntlet.config import AgentConfig
-from gauntlet.models import EvaluatorInput, EvaluatorOutput, TokenUsage
+from gauntlet.models import EvaluatorInput, EvaluatorOutput, StageSummary, TokenUsage
 from gauntlet.tools import EVALUATOR_TOOLS
 from gauntlet.trace import PipelineTrace
 
@@ -67,7 +67,9 @@ async def run_evaluator(
         "Evaluator",
         cycle,
         usage,
-        accepted=out.acceptance,
-        required_gap=(out.required_gap or "")[:120] or None,
+        StageSummary(
+            accepted=out.acceptance,
+            required_gap=(out.required_gap or "")[:120] or None,
+        ),
     )
     return out, usage

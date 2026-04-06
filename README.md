@@ -145,11 +145,17 @@ Successful response shape:
     },
     "required_gap": null,
     "rebuttal_log": [],
-    "cycles_run": 1,
-    "no_progress": false,
     "trace": {
       "position": "claim",
-      "preflight": {},
+      "preflight": {
+        "claim": "Implement mandatory 2FA for all admin routes.",
+        "domain_standard": "balance of probabilities",
+        "termination_limit": 3,
+        "grounds_count": 0,
+        "has_warrant": false,
+        "has_backing": false,
+        "generated_from": null
+      },
       "preflight_usage": { "input_tokens": 0, "output_tokens": 0 },
       "cycles": [],
       "halt_reason": "survives",

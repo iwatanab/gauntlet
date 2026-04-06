@@ -4,7 +4,7 @@ from __future__ import annotations
 from gauntlet.agents.base import run_agent
 from gauntlet.client import GauntletClient
 from gauntlet.config import AgentConfig
-from gauntlet.models import CritiqueInput, CritiqueOutput, TokenUsage
+from gauntlet.models import CritiqueInput, CritiqueOutput, StageSummary, TokenUsage
 from gauntlet.trace import PipelineTrace
 
 _SYSTEM = """\
@@ -37,15 +37,12 @@ RULES:
      inferential step.
    - No severity language, rhetoric, blame, or verdict language.
 
-4. Burden
-   - burden_bearer is always "action-recommender".
-
-5. Exchange audit
+4. Exchange audit
    - Apply pragma-dialectical rules across confrontation, opening, and argumentation.
    - Every violation must map to a specific rule.
    - If any blocking violation exists, set blocked:true and produce required_gap.
 
-6. required_gap
+5. required_gap
    - required_gap is the single canonical gap string used by later cycles.
    - If blocked, begin with exactly "Required:".
    - It must state the exact evidence, measurement, comparison, or standard
@@ -79,7 +76,6 @@ OUTPUT - JSON only:
   "open_attacks": [
     {"type":"undercutting","content":"neutral gap statement","source_agent":"critique"}
   ],
-  "burden_bearer": "action-recommender",
   "stage_audit": {
     "confrontation": "finding",
     "opening": "finding",
@@ -119,14 +115,15 @@ async def run_critique_bundle(
         "Critique Bundle",
         cycle,
         usage,
-        scheme=out.scheme,
-        open_attacks_count=len(out.open_attacks),
-        answered_cqs=answered,
-        unanswered_cqs=unanswered,
-        burden_bearer=out.burden_bearer,
-        blocked=out.stage_audit.blocked,
-        violations_count=len(out.rule_violations),
-        blocking_violations=len(blocking),
-        required_gap=out.required_gap,
+        StageSummary(
+            scheme=out.scheme,
+            open_attacks_count=len(out.open_attacks),
+            answered_cqs=answered,
+            unanswered_cqs=unanswered,
+            blocked=out.stage_audit.blocked,
+            violations_count=len(out.rule_violations),
+            blocking_violations=len(blocking),
+            required_gap=out.required_gap,
+        ),
     )
     return out, usage

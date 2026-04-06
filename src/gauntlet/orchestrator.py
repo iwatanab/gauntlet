@@ -29,7 +29,8 @@ from gauntlet.models import (
     FinalArgument,
     GauntletResult,
     Ground,
-    PipelineState,
+    PositionState,
+    PreflightSummary,
     RebuttalEntry,
     RebuttalStatus,
     TokenUsage,
@@ -174,20 +175,6 @@ def _ts() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _reset_cycle_state(state: PipelineState) -> None:
-    state.scheme = None
-    state.critical_questions = []
-    state.open_attacks = []
-    state.burden_bearer = None
-    state.stage_audit = None
-    state.rule_violations = []
-    state.acceptance = None
-    state.required_gap = None
-    state.attack_graph = None
-    state.extension = None
-    state.verdict = None
-
-
 def _blocking_entries(agent: str, descriptions: list[str]) -> list[RebuttalEntry]:
     return [
         RebuttalEntry(
@@ -201,7 +188,7 @@ def _blocking_entries(agent: str, descriptions: list[str]) -> list[RebuttalEntry
     ]
 
 
-def _blocking_descriptions(state: PipelineState) -> list[str]:
+def _blocking_descriptions(state: PositionState) -> list[str]:
     return [
         violation.description
         for violation in state.rule_violations
@@ -225,24 +212,25 @@ def _preflight_summary(
     warrant: str | None = None,
     backing: str | None = None,
     generated_from: str | None = None,
-) -> dict[str, object]:
-    summary: dict[str, object] = {
-        "claim": claim,
-        "domain_standard": domain_standard,
-        "termination_limit": TERMINATION_LIMIT,
-    }
+) -> PreflightSummary:
     if generated_from is not None:
-        summary["generated_from"] = generated_from
-    else:
-        summary.update({
-            "grounds_count": len(grounds or []),
-            "has_warrant": warrant is not None,
-            "has_backing": backing is not None,
-        })
-    return summary
+        return PreflightSummary(
+            claim=claim,
+            domain_standard=domain_standard,
+            termination_limit=TERMINATION_LIMIT,
+            generated_from=generated_from,
+        )
+    return PreflightSummary(
+        claim=claim,
+        domain_standard=domain_standard,
+        termination_limit=TERMINATION_LIMIT,
+        grounds_count=len(grounds or []),
+        has_warrant=warrant is not None,
+        has_backing=backing is not None,
+    )
 
 
-def _final_argument(state: PipelineState) -> FinalArgument:
+def _final_argument(state: PositionState) -> FinalArgument:
     return FinalArgument(
         grounds=state.grounds,
         warrant=state.warrant,
@@ -251,7 +239,7 @@ def _final_argument(state: PipelineState) -> FinalArgument:
     )
 
 
-def _issues(state: PipelineState) -> EvaluationIssues:
+def _issues(state: PositionState) -> EvaluationIssues:
     return EvaluationIssues(
         scheme=state.scheme,
         critical_questions=state.critical_questions,
@@ -267,7 +255,7 @@ async def run_claim_pipeline(
     config: GauntletConfig,
     client: GauntletClient,
     position: str,
-    preflight_summary: dict[str, object],
+    preflight_summary: PreflightSummary,
     preflight_usage: TokenUsage,
     initial_grounds: list[Ground] | None = None,
     initial_warrant: str | None = None,
@@ -276,14 +264,13 @@ async def run_claim_pipeline(
     trace = PipelineTrace(position)
     trace.set_preflight(preflight_summary, preflight_usage)
 
-    state = PipelineState(
-        domain_standard=domain_standard,
-        termination_limit=TERMINATION_LIMIT,
+    state = PositionState(
         claim=claim,
         grounds=list(initial_grounds) if initial_grounds else [],
         warrant=initial_warrant,
         backing=initial_backing,
         qualifier=qualifier,
+        domain_standard=domain_standard,
     )
 
     total_usage = preflight_usage
@@ -294,6 +281,7 @@ async def run_claim_pipeline(
 
     for cycle in range(1, TERMINATION_LIMIT + 1):
         state.cycle = cycle
+        state.final_cycle = cycle == TERMINATION_LIMIT
         trace.cycle_start(cycle, TERMINATION_LIMIT)
         print(f"    cycle {cycle}/{TERMINATION_LIMIT}", file=sys.stderr)
 
@@ -306,7 +294,7 @@ async def run_claim_pipeline(
         state.qualifier = constructor_out.qualifier
         total_usage = total_usage + usage
 
-        _reset_cycle_state(state)
+        state.reset_cycle()
 
         critique_out, usage = await run_critique_bundle(
             critique_view(state), config.for_critique, client, trace, cycle
@@ -314,13 +302,11 @@ async def run_claim_pipeline(
         state.scheme = critique_out.scheme
         state.critical_questions = critique_out.critical_questions
         state.open_attacks = critique_out.open_attacks
-        state.burden_bearer = critique_out.burden_bearer
         state.stage_audit = critique_out.stage_audit
         state.rule_violations = critique_out.rule_violations
         total_usage = total_usage + usage
 
         if critique_out.stage_audit.blocked:
-            state.acceptance = False
             state.required_gap = critique_out.required_gap
             trace.critique_blocked(
                 cycle=cycle,
@@ -328,7 +314,7 @@ async def run_claim_pipeline(
                 stage=critique_out.rule_violations[0].stage if critique_out.rule_violations else "unknown",
                 required_gap=critique_out.required_gap or "",
             )
-            outcome = _gap_outcome(state.required_gap, prev_gap, cycle, state.termination_limit)
+            outcome = _gap_outcome(state.required_gap, prev_gap, cycle, TERMINATION_LIMIT)
             if outcome:
                 state.verdict = Verdict.impasse
                 state.rebuttal_log = state.rebuttal_log + _blocking_entries(
@@ -345,13 +331,12 @@ async def run_claim_pipeline(
         evaluator_out, usage = await run_evaluator(
             evaluator_view(state), config.for_evaluator, client, trace, cycle
         )
-        state.acceptance = evaluator_out.acceptance
         state.required_gap = evaluator_out.required_gap
         total_usage = total_usage + usage
 
         if not evaluator_out.acceptance:
             trace.evaluator_rejected(cycle, evaluator_out.required_gap or "")
-            outcome = _gap_outcome(state.required_gap, prev_gap, cycle, state.termination_limit)
+            outcome = _gap_outcome(state.required_gap, prev_gap, cycle, TERMINATION_LIMIT)
             if outcome:
                 state.verdict = Verdict.impasse
                 if outcome == "no_progress":
@@ -364,8 +349,6 @@ async def run_claim_pipeline(
         resolver_out, usage = await run_resolver(
             resolver_view(state), config.for_resolver, client, trace, cycle
         )
-        state.attack_graph = resolver_out.attack_graph
-        state.extension = resolver_out.extension
         state.verdict = resolver_out.verdict
         state.rebuttal_log = state.rebuttal_log + resolver_out.rebuttal_log
         total_usage = total_usage + usage
@@ -374,7 +357,8 @@ async def run_claim_pipeline(
             break
 
     final_verdict = state.verdict or Verdict.impasse
-    trace.verdict_reached(state.cycle, final_verdict.value)
+    if not no_progress:
+        trace.verdict_reached(state.cycle, final_verdict.value)
 
     print(
         f"    [{position}] verdict={final_verdict} "
@@ -389,8 +373,6 @@ async def run_claim_pipeline(
         issues=_issues(state),
         required_gap=state.required_gap,
         rebuttal_log=state.rebuttal_log,
-        cycles_run=state.cycle,
-        no_progress=no_progress,
         trace=trace.snapshot(),
         usage=total_usage,
     )
