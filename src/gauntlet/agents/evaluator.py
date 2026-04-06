@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from gauntlet.agents.base import run_agent
 from gauntlet.client import GauntletClient
-from gauntlet.config import AgentConfig
+from gauntlet.config import AgentConfig, Mode
 from gauntlet.models import EvaluatorInput, EvaluatorOutput, StageSummary, TokenUsage
-from gauntlet.tools import EVALUATOR_TOOLS
+from gauntlet.tools import retrieval_tools
 from gauntlet.trace import PipelineTrace
 
 _SYSTEM = """\
@@ -44,6 +44,11 @@ OUTPUT - JSON only:
 }
 """
 
+_MODE_NOTE = {
+    "clinical": '\nMODE:\n- Clinical mode is active. You may use pubmed_search if it helps establish current medical standards.\n',
+    "financial": '\nMODE:\n- Financial mode is active. You may use finance_search if it helps establish current financial standards or benchmarks.\n',
+}
+
 
 async def run_evaluator(
     inp: EvaluatorInput,
@@ -51,17 +56,18 @@ async def run_evaluator(
     client: GauntletClient,
     trace: PipelineTrace,
     cycle: int,
+    mode: Mode,
 ) -> tuple[EvaluatorOutput, TokenUsage]:
     out, usage = await run_agent(
         name="Evaluator",
-        system=_SYSTEM,
+        system=_SYSTEM + _MODE_NOTE.get(mode, ""),
         input_model=inp,
         output_type=EvaluatorOutput,
         config=cfg,
         client=client,
         trace=trace,
         cycle=cycle,
-        allowed_tools=EVALUATOR_TOOLS,
+        allowed_tools=retrieval_tools(mode),
     )
     trace.agent_complete(
         "Evaluator",

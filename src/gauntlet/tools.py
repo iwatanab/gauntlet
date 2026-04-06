@@ -4,7 +4,7 @@ tools.py — Tool protocol, registry, and built-in implementations.
 ADDING A TOOL (3 steps, this file only):
   1. Implement the Tool protocol (name, description, openai_schema, execute)
   2. Call registry.register(MyTool())
-  3. Add the tool name to CONSTRUCTOR_TOOLS or EVALUATOR_TOOLS
+  3. Add the tool name to MODE_EXTRA_TOOLS if it is mode-specific
 
 Permission enforcement is structural: only tools in the allowed list passed
 to run_agent() can be called by that agent. No instruction can expand this.
@@ -17,6 +17,7 @@ import os
 from typing import Any, Protocol, runtime_checkable
 
 import httpx
+from gauntlet.config import Mode
 
 # Shared HTTP client — created lazily on first tool call, reused across all
 # subsequent calls. Avoids a TCP handshake + TLS negotiation on every search.
@@ -196,11 +197,57 @@ class DocumentFetchTool:
             return f"Failed to fetch {url}: {e}"
 
 
+class PlaceholderSearchTool:
+    def __init__(self, name: str, description: str, label: str) -> None:
+        self.name = name
+        self.description = description
+        self.label = label
+
+    def openai_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The search query."},
+                    },
+                    "required": ["query"],
+                },
+            },
+        }
+
+    async def execute(self, arguments: dict[str, Any]) -> str:
+        return (
+            f"[placeholder:{self.name}] {self.label} integration is not connected yet. "
+            f"Query: {arguments.get('query', '')!r}"
+        )
+
+
 # ── Register built-ins ────────────────────────────────────────────────────────
 
 registry.register(WebSearchTool())
 registry.register(DocumentFetchTool())
+registry.register(PlaceholderSearchTool(
+    "pubmed_search",
+    "Search PubMed via placeholder MCP integration.",
+    "PubMed MCP",
+))
+registry.register(PlaceholderSearchTool(
+    "finance_search",
+    "Search finance sources via placeholder integration.",
+    "finance",
+))
 
-# Structural permission lists — agents are given one of these
-CONSTRUCTOR_TOOLS: list[str] = ["web_search", "fetch_document"]
-EVALUATOR_TOOLS:   list[str] = ["web_search", "fetch_document"]
+BASE_RETRIEVAL_TOOLS = ["web_search", "fetch_document"]
+MODE_EXTRA_TOOLS: dict[Mode, list[str]] = {
+    "base": [],
+    "clinical": ["pubmed_search"],
+    "financial": ["finance_search"],
+}
+
+
+def retrieval_tools(mode: Mode) -> list[str]:
+    return BASE_RETRIEVAL_TOOLS + MODE_EXTRA_TOOLS[mode]

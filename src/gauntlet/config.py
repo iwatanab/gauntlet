@@ -13,6 +13,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import Literal, cast
+
+Mode = Literal["base", "clinical", "financial"]
+_MODES = ("base", "clinical", "financial")
+
+
+def _mode_from_env() -> Mode:
+    mode = os.environ.get("GAUNTLET_MODE", "base").strip().lower()
+    if mode not in _MODES:
+        raise ValueError(f"Invalid GAUNTLET_MODE {mode!r}; expected one of {', '.join(_MODES)}")
+    return cast(Mode, mode)
 
 
 @dataclass(frozen=True)
@@ -30,6 +41,7 @@ class GauntletConfig:
 
     openrouter_api_key: str
     openrouter_base_url: str
+    mode: Mode = "base"
     tavily_api_key: str = ""
 
     constructor_cfg: AgentConfig | None = None
@@ -75,5 +87,6 @@ class GauntletConfig:
             openrouter_base_url=os.environ.get(
                 "OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"
             ),
+            mode=_mode_from_env(),
             tavily_api_key=os.environ.get("TAVILY_API_KEY", ""),
         )

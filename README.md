@@ -177,7 +177,7 @@ Returns a `job_id` immediately. Poll `GET /v1/jobs/{job_id}` for status and resu
 
 ### `GET /v1/health`
 
-Reports the configured `primary_model`, `preflight_model`, and Tavily status.
+Reports the configured `mode`, `primary_model`, `preflight_model`, and Tavily status.
 
 ## Input Rules
 
@@ -202,8 +202,16 @@ Environment variables:
 | `TAVILY_API_KEY` | Tavily search key for tools |
 | `GAUNTLET_PRIMARY_MODEL` | Model for Constructor, Critique, Evaluator, Resolver |
 | `GAUNTLET_PREFLIGHT_MODEL` | Model for parsing, domain-standard inference, and contrary generation |
+| `GAUNTLET_MODE` | Global runtime mode: `base`, `clinical`, or `financial` |
 
 `GAUNTLET_FAST_MODEL` is still accepted as a fallback alias for `GAUNTLET_PREFLIGHT_MODEL`.
+If `GAUNTLET_MODE` is unset, Gauntlet defaults to `base`.
+
+Mode-specific tools are intentionally minimal in this pass:
+
+- `base`: no extra tools
+- `clinical`: adds placeholder `pubmed_search` to Constructor and Evaluator
+- `financial`: adds placeholder `finance_search` to Constructor and Evaluator
 
 ## Development
 

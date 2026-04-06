@@ -286,7 +286,7 @@ async def run_claim_pipeline(
         print(f"    cycle {cycle}/{TERMINATION_LIMIT}", file=sys.stderr)
 
         constructor_out, usage = await run_constructor(
-            constructor_view(state), config.for_constructor, client, trace, cycle
+            constructor_view(state), config.for_constructor, client, trace, cycle, config.mode
         )
         state.grounds = constructor_out.grounds
         state.warrant = constructor_out.warrant
@@ -329,7 +329,7 @@ async def run_claim_pipeline(
             continue
 
         evaluator_out, usage = await run_evaluator(
-            evaluator_view(state), config.for_evaluator, client, trace, cycle
+            evaluator_view(state), config.for_evaluator, client, trace, cycle, config.mode
         )
         state.required_gap = evaluator_out.required_gap
         total_usage = total_usage + usage

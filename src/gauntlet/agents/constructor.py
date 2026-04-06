@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from gauntlet.agents.base import run_agent
 from gauntlet.client import GauntletClient
-from gauntlet.config import AgentConfig
+from gauntlet.config import AgentConfig, Mode
 from gauntlet.models import ConstructorInput, ConstructorOutput, StageSummary, TokenUsage
-from gauntlet.tools import CONSTRUCTOR_TOOLS
+from gauntlet.tools import retrieval_tools
 from gauntlet.trace import PipelineTrace
 
 _SYSTEM = """\
@@ -72,6 +72,11 @@ OUTPUT - JSON only:
 }
 """
 
+_MODE_NOTE = {
+    "clinical": '\nMODE:\n- Clinical mode is active. You may use pubmed_search if it helps retrieve supporting medical literature.\n',
+    "financial": '\nMODE:\n- Financial mode is active. You may use finance_search if it helps retrieve supporting financial context.\n',
+}
+
 
 async def run_constructor(
     inp: ConstructorInput,
@@ -79,17 +84,18 @@ async def run_constructor(
     client: GauntletClient,
     trace: PipelineTrace,
     cycle: int,
+    mode: Mode,
 ) -> tuple[ConstructorOutput, TokenUsage]:
     out, usage = await run_agent(
         name="Constructor",
-        system=_SYSTEM,
+        system=_SYSTEM + _MODE_NOTE.get(mode, ""),
         input_model=inp,
         output_type=ConstructorOutput,
         config=cfg,
         client=client,
         trace=trace,
         cycle=cycle,
-        allowed_tools=CONSTRUCTOR_TOOLS,
+        allowed_tools=retrieval_tools(mode),
     )
     trace.agent_complete(
         "Constructor",

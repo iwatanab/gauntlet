@@ -47,6 +47,7 @@ async def health() -> dict[str, Any]:
     return {
         "status":        "ok",
         "version":       "0.3.0",
+        "mode":          _config.mode if _config else "unknown",
         "primary_model": _config.primary.model if _config else "unknown",
         "preflight_model": _config.preflight.model if _config else "unknown",
         "tavily":        "configured" if (_config and _config.tavily_api_key) else "missing",

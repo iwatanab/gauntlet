@@ -127,6 +127,7 @@ def test_health_ok(client):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
+    assert body["mode"] == "base"
     assert body["preflight_model"] == "test/preflight"
 
 
@@ -234,6 +235,7 @@ def test_config_property_accessors():
     assert cfg.for_critique.model == "primary/model"
     assert cfg.for_evaluator.model == "primary/model"
     assert cfg.for_resolver.model == "primary/model"
+    assert cfg.mode == "base"
 
 
 def test_config_per_stage_override():
@@ -249,3 +251,18 @@ def test_config_per_stage_override():
     )
     assert cfg.for_resolver.model == "override/model"
     assert cfg.for_constructor.model == "primary/model"
+
+
+def test_config_from_env_reads_and_validates_mode(monkeypatch):
+    monkeypatch.setattr("dotenv.load_dotenv", lambda *args, **kwargs: False)
+    from gauntlet.config import GauntletConfig
+
+    monkeypatch.delenv("GAUNTLET_MODE", raising=False)
+    assert GauntletConfig.from_env().mode == "base"
+    monkeypatch.setenv("GAUNTLET_MODE", "clinical")
+    assert GauntletConfig.from_env().mode == "clinical"
+    monkeypatch.setenv("GAUNTLET_MODE", "financial")
+    assert GauntletConfig.from_env().mode == "financial"
+    monkeypatch.setenv("GAUNTLET_MODE", "weird")
+    with pytest.raises(ValueError, match="Invalid GAUNTLET_MODE"):
+        GauntletConfig.from_env()
