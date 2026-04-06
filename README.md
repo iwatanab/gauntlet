@@ -2,247 +2,342 @@
 
 Better decisions through rigorous argument.
 
-Gauntlet is a bipolar deliberation harness. It evaluates both a claim and its logical contrary, constructs each position independently, and compares the resulting verdicts in pure Python. The system is built around argumentation theory, but the implementation is intentionally small: one public string input, one preflight phase, and four execution stages per cycle.
+Gauntlet is an argumentation-theory-based deliberation harness. It takes one deliberative claim, builds the strongest case for it and for its logical contrary, runs both through the same isolated reasoning pipeline, and compares the outcomes.
 
-## Philosophy
+Status: experimental research harness. The core pipeline is live; the extra tools exposed by `clinical` and `financial` mode are placeholders in this version.
 
-Gauntlet is guided by one principle:
+## Why This Exists
 
-> Separate reasoning modes, not machinery for its own sake.
+Gauntlet starts from a simple claim:
 
-The load-bearing invariants are:
+Formal deductive reasoning is necessary for some tasks, but it is not sufficient for most real-world decisions.
 
-- Bipolar independence: the claim and its contrary are constructed separately.
-- Structural field isolation: each stage sees only the fields it is allowed to see.
-- Tool isolation: only Constructor and Evaluator may use tools.
-- Deliberation only: the burden bearer is always the action recommender.
-- Three-cycle cap: the system stops after at most three attempts per position.
+In formal logic, if the premises are guaranteed to be sufficient for the conclusion, validity can do most of the work. Real decisions usually do not look like that. They involve incomplete evidence, defeasible inferences, contested standards, audience-relative acceptability, and live counterarguments.
 
-This means Gauntlet preserves epistemic isolation where it matters, while removing the standalone translation layer and other derived machinery that used to exist only to repair upstream outputs.
+That is the problem Gauntlet is built for.
 
-## Runtime
+It is not a theorem prover. It is a deliberation system for open-textured, revisable decisions where:
 
-Public request:
+- the claim may already contain evidence, warrants, and backing
+- the right standard must be inferred and applied
+- the strongest contrary position must be considered, not ignored
+- unresolved attacks should block overconfident conclusions
 
-```json
-"We should discharge this patient because serial troponins are negative and the ECG is unchanged."
-```
+## Theoretical Foundations
 
-Preflight:
+Gauntlet is not "inspired by argumentation" in a vague way. Each stage is tied to a distinct tradition and a distinct job.
 
-1. Validate that the input contains exactly one atomic claim.
-2. Extract any explicit Toulmin components already present in the string.
-3. Infer the domain standard for the evaluator.
-4. Generate the logical contrary.
+| Thinker / tradition | Contribution to Gauntlet | Where it shows up in code |
+|---|---|---|
+| Stephen Toulmin | Real arguments are not exhausted by formal validity; claims are supported by grounds, warrants, backing, and qualifiers. | Preflight extraction and the Constructor stage |
+| Douglas Walton, Chris Reed, Fabrizio Macagno | Argument schemes and their critical questions provide a way to test defeasible reasoning patterns. | Critique Bundle scheme classification and critical questions |
+| Frans van Eemeren, Rob Grootendorst | Pragma-dialectics treats argument as a regulated critical discussion with rule-governed failure modes. | Critique Bundle stage audit and blocking rule violations |
+| Chaim Perelman, Lucie Olbrechts-Tyteca | Acceptability depends on what a relevant audience would accept, not on formal validity alone. | Evaluator stage and inferred `domain_standard` |
+| Phan Minh Dung | Arguments stand or fall in light of attacks and defense, not in isolation. | Resolver stage verdict logic |
+| Henry Prakken, Sanjay Modgil, ASPIC+ | Defeasible reasoning needs distinctions like rebuttal, undercutting, and undermining. | Attack types and Resolver semantics |
+| Hugo Mercier, Dan Sperber | Human reasoning is biased and adversarial; good systems should structure disagreement rather than assume neutral introspection. | Bipolar evaluation and stage isolation |
+| Donald Schon | Real practice requires problem-setting, not just technical rule application after the problem is already fixed. | Preflight framing: atomic-claim extraction and domain-standard inference |
 
-Per position, per cycle:
+## What Gauntlet Does
 
-```text
-Constructor (tools)
--> Critique Bundle (no tools)
-   blocked? -> loop using required_gap
--> Evaluator (tools)
-   rejected? -> loop using required_gap
--> Resolver (no tools)
-```
-
-The cycle cap is fixed at `3`.
-
-## Stages
-
-### Constructor
-
-Basis: Toulmin.
-
-- Builds the strongest defensible argument for the claim.
-- Preserves user-provided grounds verbatim.
-- Treats user-provided grounds as stipulated true.
-- Strengthens the warrant and backing aggressively.
-- Uses tools only for evidence retrieval.
-- Produces the single canonical warrant used downstream.
-
-### Critique Bundle
-
-Basis: Walton + pragma-dialectics.
-
-- Classifies the argument scheme.
-- Attaches critical questions.
-- Converts unanswered critical questions into neutral `open_attacks`.
-- Audits the exchange for blocking rule violations.
-- Produces one canonical `required_gap` when the cycle must continue.
-
-### Evaluator
-
-Basis: Perelman & Olbrechts-Tyteca.
-
-- Sees `domain_standard`; no other stage does.
-- Decides whether the universal audience for that standard would act on the argument.
-- Produces one canonical `required_gap` when the argument is not yet acceptable.
-- May use tools only to establish standards, not case evidence.
-
-### Resolver
-
-Basis: Dung + ASPIC+.
-
-- Consumes the canonical attacks and canonical gap.
-- Builds the attack graph.
-- Determines whether the claim survives, is defeated, or reaches impasse.
-
-## Why The Translation Layer Is Gone
-
-Older versions used a separate translation layer to rewrite warrants, attacks, and gaps after the producing stage. That design increased latency, retries, and failure surfaces while also acting like a hidden extra judge.
-
-The current design removes that layer entirely:
-
-- Constructor emits the canonical warrant directly.
-- Critique emits neutral attacks directly.
-- Critique and Evaluator emit canonical `Required:` gaps directly.
-
-Boundary-safe output is now the responsibility of the producing stage.
-
-## Field Isolation
-
-Isolation is enforced by typed stage inputs created from a shared internal `PipelineState`.
-
-Key visibility rules:
-
-- Constructor cannot see `domain_standard`, attacks, rule violations, or verdict.
-- Critique cannot see `domain_standard`, rebuttal history, or verdict.
-- Evaluator cannot see `open_attacks` or `rebuttal_log`.
-- Resolver cannot see `domain_standard`.
-
-Separate execution contexts are still retained where hidden-field or tool boundaries require them.
-
-## API
-
-### `POST /v1/evaluate`
-
-Request body:
+Gauntlet accepts a single JSON string:
 
 ```json
 "Implement mandatory 2FA for all admin routes."
 ```
 
-Successful response shape:
+It then:
 
-```json
-{
-  "id": "uuid",
-  "claim_evaluation": {
-    "claim": "Implement mandatory 2FA for all admin routes.",
-    "verdict": "survives",
-    "final_argument": {
-      "grounds": [],
-      "warrant": "It is assumed that: ...",
-      "backing": null,
-      "qualifier": "presumably"
-    },
-    "issues": {
-      "scheme": "argument_from_practical_reasoning",
-      "critical_questions": [],
-      "open_attacks": [],
-      "rule_violations": []
-    },
-    "required_gap": null,
-    "rebuttal_log": [],
-    "trace": {
-      "position": "claim",
-      "preflight": {
-        "claim": "Implement mandatory 2FA for all admin routes.",
-        "domain_standard": "balance of probabilities",
-        "termination_limit": 3,
-        "grounds_count": 0,
-        "has_warrant": false,
-        "has_backing": false,
-        "generated_from": null
-      },
-      "preflight_usage": { "input_tokens": 0, "output_tokens": 0 },
-      "cycles": [],
-      "halt_reason": "survives",
-      "metrics": { "stage_calls": 4, "tool_calls": 1, "cycles_used": 1 }
-    },
-    "usage": { "input_tokens": 0, "output_tokens": 0 }
-  },
-  "contrary_evaluation": { "...": "same shape" },
-  "comparison": "definite_conclusion",
-  "recommended_position": "Implement mandatory 2FA for all admin routes.",
-  "inferred_domain_standard": "balance of probabilities",
-  "total_usage": { "input_tokens": 0, "output_tokens": 0 }
-}
+1. validates that the input contains exactly one atomic claim
+2. extracts any explicit Toulmin components already present in the string
+3. infers the domain standard for evaluation
+4. generates the logical contrary
+5. runs both claim and contrary through the same four-stage pipeline
+6. compares the two outcomes in pure Python
+
+The current pipeline is:
+
+```text
+Preflight
+  -> parse one atomic claim
+  -> extract grounds / warrant / backing / qualifier
+  -> infer domain_standard
+  -> generate contrary
+
+Per position (claim, contrary), per cycle:
+  Constructor (tools)
+  -> Critique Bundle (no tools)
+     blocked? -> loop using required_gap
+  -> Evaluator (tools)
+     rejected? -> loop using required_gap
+  -> Resolver (no tools)
+
+Final:
+  compare claim vs contrary
+  -> recommend a position or report that the evidence is insufficient
 ```
 
-### `POST /v1/evaluate/async`
+## Design Invariants
 
-Returns a `job_id` immediately. Poll `GET /v1/jobs/{job_id}` for status and result.
+These are the load-bearing architectural constraints in the current codebase:
 
-### `GET /v1/health`
+- Bipolar independence: the claim and its contrary are constructed independently.
+- Structural field isolation: each stage sees only the fields it is allowed to see.
+- Tool isolation: only Constructor and Evaluator may use tools.
+- Deliberation only: the system evaluates action-guiding claims, not arbitrary dialogue modes.
+- Three-cycle cap: each position gets at most three attempts.
+- No translation layer: stages must emit canonical outputs directly instead of relying on downstream rewrite passes.
 
-Reports the configured `mode`, `primary_model`, `preflight_model`, and Tavily status.
+## Stage Map
 
-## Input Rules
+### Preflight
 
-The request body must be a single string containing one atomic claim.
+Preflight is a separate model role used for parsing and setup.
 
-If multiple atomic claims are identified, Gauntlet returns `422` immediately with:
+It performs four jobs:
 
-- `code: "multiple_claims"`
-- a refusal message
-- the list of atomic claims it identified
+- reject no-claim or multi-claim inputs
+- extract grounds verbatim from the user's text
+- extract explicit warrant, backing, and qualifier when present
+- infer `domain_standard` and generate the contrary claim
 
-Grounds, warrant, backing, and qualifier may all be embedded in the same input string and are extracted during preflight.
+Important detail: user-provided grounds are preserved verbatim and treated as stipulated true by the Constructor, because they may come from private records that are not publicly verifiable.
 
-## Configuration
+### Constructor
 
-Environment variables:
+Basis: Toulmin.
 
-| Variable | Purpose |
-|---|---|
-| `OPENROUTER_API_KEY` | OpenRouter API key |
-| `OPENROUTER_BASE_URL` | OpenRouter base URL |
-| `TAVILY_API_KEY` | Tavily search key for tools |
-| `GAUNTLET_PRIMARY_MODEL` | Model for Constructor, Critique, Evaluator, Resolver |
-| `GAUNTLET_PREFLIGHT_MODEL` | Model for parsing, domain-standard inference, and contrary generation |
-| `GAUNTLET_MODE` | Global runtime mode: `base`, `clinical`, or `financial` |
+The Constructor builds the strongest defensible case for the claim. It is allowed to retrieve additional grounds, strengthen a weak warrant, and add backing. It does not see `domain_standard`, attacks, rule violations, or verdicts.
 
-`GAUNTLET_FAST_MODEL` is still accepted as a fallback alias for `GAUNTLET_PREFLIGHT_MODEL`.
-If `GAUNTLET_MODE` is unset, Gauntlet defaults to `base`.
+### Critique Bundle
 
-Mode-specific tools are intentionally minimal in this pass:
+Basis: Walton + pragma-dialectics.
 
-- `base`: no extra tools
-- `clinical`: adds placeholder `pubmed_search` to Constructor and Evaluator
-- `financial`: adds placeholder `finance_search` to Constructor and Evaluator
+The Critique Bundle classifies the warrant's argument scheme, attaches critical questions, converts unanswered questions into neutral `open_attacks`, and checks whether the exchange is procedurally fit to continue. If not, it emits one canonical `Required:` gap string.
 
-## Development
+### Evaluator
 
-Run the API:
+Basis: Perelman & Olbrechts-Tyteca.
+
+The Evaluator is the only stage that sees `domain_standard`. It asks whether the relevant universal audience would act on the argument as it currently stands. If not, it emits one canonical `Required:` gap string.
+
+### Resolver
+
+Basis: Dung + ASPIC+.
+
+The Resolver treats attacks, blocking violations, and unresolved gaps as live attacks on the claim. It returns one of three verdicts:
+
+- `survives`
+- `defeated`
+- `impasse`
+
+## Modes
+
+Gauntlet has one global runtime mode, configured with `GAUNTLET_MODE`.
+
+Valid values:
+
+- `base`
+- `clinical`
+- `financial`
+
+If `GAUNTLET_MODE` is unset, Gauntlet defaults to `base`. If it is set to anything else, startup fails fast.
+
+Mode affects only the two tool-using stages and a small runtime prompt cue. It does not change the public API shape.
+
+| Mode | Extra tools | Notes |
+|---|---|---|
+| `base` | none | Default mode |
+| `clinical` | `pubmed_search` | Placeholder for PubMed-style clinical retrieval |
+| `financial` | `finance_search` | Placeholder for finance-specific retrieval |
+
+Current tool surface:
+
+- `web_search`: Tavily-backed web search
+- `fetch_document`: fetch a known URL
+- `pubmed_search`: placeholder only in this version
+- `finance_search`: placeholder only in this version
+
+Only Constructor and Evaluator can use tools. Critique Bundle and Resolver are always tool-free.
+
+## Quickstart
+
+### Requirements
+
+- Python 3.11+
+- an OpenRouter-compatible API key
+- optionally, a Tavily API key if you want `web_search` to work
+
+### Install
+
+```bash
+python -m venv .venv
+# Windows PowerShell: .\.venv\Scripts\Activate.ps1
+# macOS/Linux: source .venv/bin/activate
+
+pip install -e .
+# or, for tests:
+pip install -e .[dev]
+```
+
+### Configure
+
+Create a `.env` from `.env.example` or export environment variables directly.
+
+Minimal configuration:
+
+```env
+OPENROUTER_API_KEY=your-openrouter-api-key
+GAUNTLET_PRIMARY_MODEL=anthropic/claude-opus-4-6
+GAUNTLET_PREFLIGHT_MODEL=anthropic/claude-haiku-4-5
+GAUNTLET_MODE=base
+```
+
+Optional:
+
+```env
+TAVILY_API_KEY=your-tavily-api-key
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+GAUNTLET_HOST=0.0.0.0
+GAUNTLET_PORT=8000
+GAUNTLET_RELOAD=false
+```
+
+Legacy compatibility: `GAUNTLET_FAST_MODEL` is still accepted as a fallback alias for `GAUNTLET_PREFLIGHT_MODEL`.
+
+### Run
 
 ```bash
 gauntlet
 ```
 
-Run tests:
+or:
+
+```bash
+python -m gauntlet
+```
+
+The API binds to `0.0.0.0:8000` by default and is typically reached at `http://127.0.0.1:8000`.
+
+Health check:
+
+```text
+GET /v1/health
+```
+
+The health response reports:
+
+- `status`
+- `version`
+- `mode`
+- `primary_model`
+- `preflight_model`
+- `tavily`
+
+### Test
 
 ```bash
 pytest -q
 ```
 
-Core source layout:
+## API
+
+### `POST /v1/evaluate`
+
+Synchronous evaluation.
+
+Request body: a single JSON string, not an object.
+
+```json
+"Implement mandatory 2FA for all admin routes."
+```
+
+If the input is invalid, the API returns `422`.
+
+Important failure cases:
+
+- empty input
+- prompt-injection-like input
+- no testable argumentative claim
+- multiple atomic claims
+
+If multiple atomic claims are detected, Gauntlet stops immediately and returns the list it identified.
+
+### `POST /v1/evaluate/async`
+
+Starts the same evaluation asynchronously and returns a `job_id`.
+
+### `GET /v1/jobs/{job_id}`
+
+Returns async job status and result.
+
+### `DELETE /v1/jobs/{job_id}`
+
+Deletes an async job record.
+
+## Response Shape
+
+The top-level response includes:
+
+- `claim_evaluation`
+- `contrary_evaluation`
+- `comparison`
+- `recommended_position`
+- `inferred_domain_standard`
+- `total_usage`
+
+Each `ClaimEvaluation` includes:
+
+- `claim`
+- `verdict`
+- `final_argument`
+- `issues`
+- `required_gap`
+- `rebuttal_log`
+- `trace`
+- `usage`
+
+Comparison outcomes:
+
+- `definite_conclusion`
+- `wrong_starting_position`
+- `equipoise`
+- `insufficient_evidence`
+
+## Repository Layout
 
 ```text
 src/gauntlet/
-  api.py
-  client.py
-  config.py
-  models.py
-  orchestrator.py
-  parsing.py
-  trace.py
-  tools.py
+  api.py            FastAPI app
+  config.py         env-driven runtime config
+  client.py         OpenRouter client and structured output handling
+  orchestrator.py   preflight + bipolar pipeline orchestration
+  parsing.py        atomic-claim parsing and Toulmin extraction
+  validation.py     request guardrails
+  tools.py          tool registry and mode-gated tool lists
+  trace.py          hierarchical trace accumulation
   agents/
-    base.py
     constructor.py
     critique.py
     evaluator.py
     resolver.py
 ```
+
+## Current Limitations
+
+- `clinical` and `financial` mode currently add placeholder tools, not live MCP integrations.
+- The request contract is intentionally narrow: one string, one atomic claim.
+- The service is optimized for deliberation, not formal proof generation.
+- The system may conclude `impasse` or `insufficient_evidence`; it is allowed to fail closed.
+
+## References
+
+- [Isa Watanabe, "Argumentation for AI [Part 1]: The Limits of Formal Reasoning"](https://medium.com/@isaiahwatanabe/argumentation-for-ai-part-1-the-limits-of-formal-reasoning-aa4edab90231)
+- [Stephen Toulmin, *The Uses of Argument*](https://en.wikipedia.org/wiki/The_Uses_of_Argument)
+- [Chaim Perelman and Lucie Olbrechts-Tyteca, *The New Rhetoric*](https://www.britannica.com/biography/Chaim-Perelman)
+- [Douglas Walton, Chris Reed, and Fabrizio Macagno, *Argumentation Schemes*](https://en.wikipedia.org/wiki/Argumentation_scheme)
+- [Frans H. van Eemeren and Rob Grootendorst, pragma-dialectics](https://iep.utm.edu/argumentation-theory/)
+- [Phan Minh Dung, "On the Acceptability of Arguments and Its Fundamental Role in Nonmonotonic Reasoning, Logic Programming and n-Person Games"](https://doi.org/10.1016/0004-3702(94)00041-X)
+- [Henry Prakken and Sanjay Modgil, ASPIC+ structured argumentation](https://link.springer.com/article/10.1007/s10472-011-9285-0)
+- [Hugo Mercier and Dan Sperber, "Why do humans reason? Arguments for an argumentative theory"](https://pubmed.ncbi.nlm.nih.gov/27450708/)
+- [Donald Schon, *The Reflective Practitioner*](https://www.taylorfrancis.com/books/mono/10.4324/9781315237473/reflective-practitioner-donald-schon)
